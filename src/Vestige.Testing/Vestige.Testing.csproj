@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>Vestige.Testing</PackageId>
+    <Description>Test helpers for Vestige wide event logging: in-memory sink, test accessors, and fluent assertions.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Vestige\Vestige.csproj" />
+  </ItemGroup>
+
+</Project>

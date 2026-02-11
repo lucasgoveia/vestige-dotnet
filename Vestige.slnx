@@ -1,0 +1,19 @@
+<Solution>
+  <Folder Name="/samples/">
+    <Project Path="samples/Vestige.Sample/Vestige.Sample.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/Vestige.Enrichers.Activity/Vestige.Enrichers.Activity.csproj" />
+    <Project Path="src/Vestige.Enrichers.Environment/Vestige.Enrichers.Environment.csproj" />
+    <Project Path="src/Vestige.Enrichers.HttpRequest/Vestige.Enrichers.HttpRequest.csproj" />
+    <Project Path="src/Vestige.Enrichers.HttpResponse/Vestige.Enrichers.HttpResponse.csproj" />
+    <Project Path="src/Vestige.Extensions.AspNetCore/Vestige.Extensions.AspNetCore.csproj" />
+    <Project Path="src/Vestige.Extensions.Hosting/Vestige.Extensions.Hosting.csproj" />
+    <Project Path="src/Vestige.Sinks.Console/Vestige.Sinks.Console.csproj" />
+    <Project Path="src/Vestige.Testing/Vestige.Testing.csproj" />
+    <Project Path="src/Vestige/Vestige.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Vestige.Tests/Vestige.Tests.csproj" />
+  </Folder>
+</Solution>

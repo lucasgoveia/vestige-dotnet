@@ -1,0 +1,36 @@
+@host = http://localhost:5256
+
+### List orders
+GET {{host}}/orders
+Accept: application/json
+
+###
+
+### Get a known order (id=42)
+GET {{host}}/orders/42
+Accept: application/json
+
+###
+
+### Get an unknown order — triggers 404, sampler keeps it
+GET {{host}}/orders/99
+Accept: application/json
+
+###
+
+### Create an order — includes sub-timer for db.insert
+POST {{host}}/orders
+Content-Type: application/json
+
+{
+  "product": "Widget C",
+  "quantity": 3,
+  "customerId": "cust_abc123"
+}
+
+###
+
+### Trigger an unhandled error — sampler always keeps errors
+GET {{host}}/error
+
+###

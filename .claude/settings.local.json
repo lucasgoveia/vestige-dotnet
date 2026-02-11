@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dotnet new:*)",
+      "Bash(del \"E:\\\\govei\\\\code\\\\vestige\\\\lib\\\\Vestige.sln\")",
+      "Bash(dotnet sln:*)",
+      "Bash(dotnet build:*)",
+      "Bash(dotnet test:*)",
+      "Bash(ls \"E:\\\\govei\\\\code\\\\vestige\\\\lib\\\\tests\\\\Vestige.Tests\\\\bin\\\\Debug\\\\net9.0\"\" 2>&1 | grep -i \"xunit|testadapter \")",
+      "Bash(\"tests/Vestige.Tests/bin/Debug/net9.0/Vestige.Tests.exe\")",
+      "Bash(dotnet pack:*)"
+    ]
+  }
+}

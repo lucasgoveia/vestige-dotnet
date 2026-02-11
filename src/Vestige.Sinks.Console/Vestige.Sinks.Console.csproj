@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>Vestige.Sinks.Console</PackageId>
+    <Description>Console sink for Vestige wide event logging.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Vestige\Vestige.csproj" />
+    <PackageReference Include="System.Text.Json" />
+  </ItemGroup>
+
+</Project>

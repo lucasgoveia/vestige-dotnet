@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>Vestige.Enrichers.Activity</PackageId>
+    <Description>Activity/OTel enricher for Vestige — stamps trace_id, span_id, and baggage fields.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Vestige\Vestige.csproj" />
+  </ItemGroup>
+
+</Project>

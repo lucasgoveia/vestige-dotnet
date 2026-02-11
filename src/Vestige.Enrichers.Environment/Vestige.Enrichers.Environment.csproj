@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>Vestige.Enrichers.Environment</PackageId>
+    <Description>Environment enricher for Vestige — stamps host, OS, runtime, and process fields.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Vestige\Vestige.csproj" />
+  </ItemGroup>
+
+</Project>
