@@ -28,14 +28,19 @@ public sealed class WideEventAssertions
         return this;
     }
 
-    /// <summary>Assert that a named timer recorded at least <paramref name="minMs"/> milliseconds.</summary>
-    public WideEventAssertions HaveTimingGreaterThan(string operationName, long minMs)
+    /// <summary>
+    /// Assert that a scope's <c>{scopeName}.duration_ms</c> field is present and
+    /// at least <paramref name="minMs"/> milliseconds.
+    /// </summary>
+    public WideEventAssertions HaveScopeDurationGreaterThan(string scopeName, double minMs)
     {
-        if (!_ev.Timings.TryGetValue(operationName, out var ms))
-            throw new AssertionException($"Expected WideEvent to have timing '{operationName}', but it was not found.");
+        var key = $"{scopeName}.duration_ms";
+        if (!_ev.Has(key))
+            throw new AssertionException($"Expected WideEvent to have scope '{scopeName}' (field '{key}'), but it was not found.");
 
+        var ms = _ev.Get<double>(key);
         if (ms < minMs)
-            throw new AssertionException($"Expected timing '{operationName}' to be >= {minMs}ms, but was {ms}ms.");
+            throw new AssertionException($"Expected scope '{scopeName}.duration_ms' to be >= {minMs}ms, but was {ms}ms.");
 
         return this;
     }

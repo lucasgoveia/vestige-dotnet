@@ -1,4 +1,4 @@
-using System.Text;
+using System.IO;
 using System.Text.Json;
 using Microsoft.Extensions.Options;
 
@@ -8,6 +8,8 @@ namespace Vestige.Sinks.Console;
 public sealed class ConsoleSink : IWideEventSink
 {
     private static readonly JsonSerializerOptions s_indented = new() { WriteIndented = true };
+    private static readonly byte[] s_newline = [(byte)'\n'];
+    private static readonly Stream s_stdout = System.Console.OpenStandardOutput();
     private readonly ConsoleSinkOptions _options;
 
     public ConsoleSink(IOptions<ConsoleSinkOptions> options)
@@ -41,10 +43,14 @@ public sealed class ConsoleSink : IWideEventSink
 
     private void WriteData(WideEventData data)
     {
-        string json = _options.Indented
-            ? JsonSerializer.Serialize(data.Fields, s_indented)
-            : Encoding.UTF8.GetString(data.JsonBytes);
+        if (_options.Indented)
+        {
+            string json = JsonSerializer.Serialize(data.Fields, s_indented);
+            System.Console.WriteLine(json);
+            return;
+        }
 
-        System.Console.WriteLine(json);
+        s_stdout.Write(data.JsonBytes, 0, data.JsonBytes.Length);
+        s_stdout.Write(s_newline, 0, s_newline.Length);
     }
 }

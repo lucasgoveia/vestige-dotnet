@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>Vestige.Enrichers.Thread</PackageId>
+    <Description>Thread enricher for Vestige — stamps thread.id, thread.name, and thread.pool_count.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Vestige\Vestige.csproj" />
+  </ItemGroup>
+
+</Project>

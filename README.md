@@ -59,8 +59,6 @@ Vestige emits **one wide event** at the end of each request:
   "payment.provider": "stripe",
   "payment.charge.duration_ms": 289,
   "payment.attempt": 1,
-  "db.query_count": 3,
-  "db.total_duration_ms": 124,
   "feature_flags.new_checkout": true
 }
 ```
@@ -153,7 +151,7 @@ The `?.` null-conditional pattern means this code works cleanly even in unit tes
 
 **Tail sampling built in.** Keep 100% of errors, slow requests, and VIP users. Randomly sample the rest. Control costs without losing signal.
 
-**OTel-friendly.** Optional `Vestige.Extensions.OpenTelemetry` package syncs your wide event fields onto OTel spans — richer traces with no infrastructure changes.
+**OTel-friendly.** Optional `Vestige.Extensions.OpenTelemetry` package bridges your wide events with OTel spans — bidirectionally.
 
 ## Packages
 
@@ -169,10 +167,8 @@ The `?.` null-conditional pattern means this code works cleanly even in unit tes
 | Package | Description |
 |---|---|
 | [`Vestige.Extensions.AspNetCore`](src/Vestige.Extensions.AspNetCore) | Middleware, `UseVestige()`, scoped event accessor from `HttpContext`. |
-| [`Vestige.Extensions.HttpClient`](src/Vestige.Extensions.HttpClient) | `DelegatingHandler` that auto-times outgoing HTTP calls (`http_out.*` fields). |
-| [`Vestige.Extensions.EntityFrameworkCore`](src/Vestige.Extensions.EntityFrameworkCore) | Auto-captures `db.*` fields: query count, duration, slow queries, rows affected. |
 | [`Vestige.Extensions.Hosting`](src/Vestige.Extensions.Hosting) | `IWideEventScopeFactory` for background services. Pipeline flush on shutdown. |
-| [`Vestige.Extensions.OpenTelemetry`](src/Vestige.Extensions.OpenTelemetry) | Syncs wide event fields onto `Activity` (OTel span) as tags. |
+| [`Vestige.Extensions.OpenTelemetry`](src/Vestige.Extensions.OpenTelemetry) | Bidirectional sync: reads OTel Activity tags into WideEvent, writes Vestige fields onto Activity spans. |
 
 ### Enrichers
 
@@ -198,7 +194,7 @@ The `?.` null-conditional pattern means this code works cleanly even in unit tes
 
 | Package | Description |
 |---|---|
-| [`Vestige.Bridges.Serilog`](src/Vestige.Bridges.Serilog) | Forward Serilog events to the current wide event. |
+| [`Vestige.Bridges.Serilog`](src/Vestige.Bridges.Serilog) | Forward Serilog events to the current wide event. Migration tool. |
 | [`Vestige.Bridges.MicrosoftLogging`](src/Vestige.Bridges.MicrosoftLogging) | Capture `ILogger` calls on the current wide event. |
 
 ## Sampling
@@ -241,7 +237,7 @@ builder.Services
         o.BootstrapServers = "kafka:9092";
         o.Topic = "wide-events";
     })
-    // Optional: sync fields to OTel spans too
+    // Optional: bridge with OTel
     .AddOpenTelemetrySync()
     // Sampling
     .ConfigureSampling(sampling =>
@@ -300,48 +296,50 @@ public class OrderProcessor : BackgroundService
 
 ## Vestige and OpenTelemetry
 
-Vestige is a **logging library**. OpenTelemetry is a **telemetry protocol and SDK**. They're complementary.
+Vestige and OpenTelemetry own different things:
 
-Vestige's job is giving you a clean API to build wide events with rich business context and emit them to sinks. OTel's job is standardizing how telemetry moves across your infrastructure.
+| Concern | Owner |
+|---|---|
+| Business context (user, cart, payment, feature flags) | **Vestige** |
+| HTTP request/response metadata, identity, environment | **Vestige enrichers** |
+| DB query timing (SqlClient, Npgsql, EF Core) | **OpenTelemetry auto-instrumentation** |
+| Outgoing HTTP call timing | **OpenTelemetry auto-instrumentation** |
+| gRPC / messaging client spans | **OpenTelemetry auto-instrumentation** |
+| Bridging both worlds | **Vestige.Extensions.OpenTelemetry** |
 
-If your team uses OTel, the optional `Vestige.Extensions.OpenTelemetry` package syncs your wide event fields onto the current `Activity` span as tags. Your OTel backend (Jaeger, Honeycomb, Datadog, Tempo) then shows those fields on traces — no collector or pipeline changes needed.
+OTel has battle-tested auto-instrumentation for database clients, HTTP clients, gRPC, and more. Vestige doesn't duplicate that. Instead, the optional `Vestige.Extensions.OpenTelemetry` package bridges both worlds bidirectionally:
+
+**Reads IN**: OTel auto-instrumented Activity tags (db duration, HTTP call details) are imported into the WideEvent — your wide event gets infrastructure data for free.
+
+**Writes OUT**: Vestige business fields are copied onto the Activity span — your OTel backend shows rich business context on traces.
 
 ```csharp
 builder.Services
     .AddVestige(o => o.ServiceName = "checkout-service")
     .AddHttpRequestEnricher()
-    .AddConsoleSink()                    // primary: Vestige emits wide events to sinks
-    .AddOpenTelemetrySync();             // bonus: also enrich OTel spans with the same fields
+    .AddConsoleSink()
+    .AddOpenTelemetrySync();             // one line: bridge both worlds
 ```
 
-**Before** Vestige (typical OTel span):
+The result — one wide event containing fields from both sources:
 
-```
-span: POST /api/checkout
-├── http.method: POST
-├── http.route: /api/checkout
-├── http.status_code: 200
-└── duration: 1247ms
-```
+```json
+{
+  "user.id": "user_789",
+  "user.subscription": "premium",
+  "cart.total_cents": 16000,
+  "payment.provider": "stripe",
+  "payment.charge.duration_ms": 1089,
+  "feature_flags.new_checkout": true,
 
-**After** adding Vestige with OTel sync:
-
-```
-span: POST /api/checkout
-├── http.method: POST
-├── http.route: /api/checkout
-├── http.status_code: 200
-├── duration: 1247ms
-├── user.id: user_789
-├── user.subscription: premium
-├── cart.total_cents: 16000
-├── payment.provider: stripe
-├── payment.attempt: 3
-├── feature_flags.new_checkout: true
-└── error.code: card_declined
+  "db.system": "postgresql",
+  "db.duration_ms": 47,
+  "http.url": "https://api.stripe.com/v1/charges",
+  "http.status_code": 200
+}
 ```
 
-Same code, same `ev.Set()` calls — the fields go to your sinks AND onto the OTel span.
+Top half from Vestige (your code). Bottom half from OTel (auto-instrumented). One event, complete picture.
 
 **You don't need OTel to use Vestige.** Vestige works standalone with just sinks. The OTel sync is a one-line opt-in for teams that want both.
 
@@ -385,7 +383,7 @@ await service.ProcessAsync(cart, user); // ev?.Set() is a no-op
 
 ## Extending Vestige
 
-Vestige is designed for extension. Write your own enrichers, sinks, or bridges by implementing a single interface and providing an extension method on `VestigeBuilder`.
+Write your own enrichers or sinks by implementing a single interface and providing an extension method on `VestigeBuilder`.
 
 **Custom enricher:**
 
@@ -437,7 +435,7 @@ public static class VestigeBuilderExtensions
 }
 ```
 
-See the [Writing Enrichers](docs/writing-enrichers.md), [Writing Sinks](docs/writing-sinks.md), and [OpenTelemetry Integration](docs/opentelemetry-integration.md) guides for full details.
+See [Writing Enrichers](docs/writing-enrichers.md) and [Writing Sinks](docs/writing-sinks.md) for full details.
 
 ## Documentation
 
@@ -447,7 +445,6 @@ See the [Writing Enrichers](docs/writing-enrichers.md), [Writing Sinks](docs/wri
 - [Writing Custom Sinks](docs/writing-sinks.md)
 - [OpenTelemetry Integration](docs/opentelemetry-integration.md)
 - [Sampling Strategies](docs/sampling.md)
-- [Migrating from Serilog](docs/migration-from-serilog.md)
 
 ## Philosophy
 

@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>Vestige.Extensions.OpenTelemetry</PackageId>
+    <Description>OpenTelemetry sync for Vestige — bidirectional bridge between WideEvent fields and Activity span tags.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Vestige\Vestige.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -34,14 +34,14 @@ public sealed class SystemTextJsonSerializerTests
     }
 
     [Fact]
-    public void Serialize_TimingsPrefixedWithTimer()
+    public void Serialize_ScopeDurationAppearsAsProperty()
     {
         var ev = new WideEvent();
-        using (ev.Time("db.query")) { /* instant */ }
+        using (ev.Scope("db.query")) { /* instant */ }
 
         var data = _serializer.Serialize(ev);
 
-        Assert.True(data.Fields.ContainsKey("timer.db.query"));
+        Assert.True(data.Fields.ContainsKey("db.query.duration_ms"));
     }
 
     [Fact]

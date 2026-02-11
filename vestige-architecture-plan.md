@@ -8,56 +8,63 @@
 
 Vestige is a **wide event logging library for .NET**. It implements the canonical log line pattern: instead of scattering dozens of low-context log lines per request, you accumulate one rich, structured event throughout the request lifecycle and emit it once at the end.
 
-The primary output is a **JSON event sent to one or more sinks** — Console, File, Seq, Kafka, Azure Event Hubs, or anything you build. This is the core of Vestige: a logging library optimized for high-cardinality, high-dimensionality structured events.
+The primary output is a **JSON event sent to one or more sinks** — Console, File, Seq, Kafka, Azure Event Hubs, or anything you build.
 
-As an optional extension, Vestige can also sync its fields onto the current OpenTelemetry `Activity` span, so teams with existing OTel pipelines get richer spans for free without changing their infrastructure.
+### What Vestige Owns
 
-### Key Tenets (from [loggingsucks.com](https://loggingsucks.com/))
+**Business context.** The stuff only your application code knows: who the user is, what they're trying to do, which feature flags are active, what their cart contains, how many payment retries happened, what subscription tier they're on.
 
-- **One event per request per service** — not dozens of log lines, one comprehensive record.
-- **High cardinality** — fields like `user.id`, `order.id`, `trace_id` with millions of unique values.
-- **High dimensionality** — 50–100+ fields per event covering infrastructure, business context, errors, timings, and feature flags.
-- **Tail sampling** — keep 100% of errors/slow/VIP requests, randomly sample the rest.
-- **Queryable, not greppable** — structured JSON for columnar stores, not string search.
+### What Vestige Does NOT Own
+
+**Infrastructure instrumentation.** Database query timing, outgoing HTTP call tracing, gRPC client spans, connection pool metrics — this is OpenTelemetry's job. OTel has battle-tested auto-instrumentation libraries for SqlClient, Npgsql, HttpClient, EF Core, gRPC, and dozens more. Vestige doesn't duplicate that work.
+
+### How They Meet
+
+The optional `Vestige.Extensions.OpenTelemetry` package bridges both worlds:
+
+- **Reads** OTel auto-instrumented Activity tags (db duration, HTTP status, etc.) **into** the WideEvent, so your wide event contains infrastructure data without you writing any code.
+- **Writes** Vestige business context fields **onto** the Activity span, so your OTel backend shows rich business tags on traces.
+
+```
+┌──────────────────────────────┐  ┌──────────────────────────────┐
+│       OpenTelemetry          │  │          Vestige              │
+│                              │  │                               │
+│  Auto-instrumentation:       │  │  Business context:            │
+│  · SqlClient query timing    │  │  · ev.Set("user.id", ...)    │
+│  · HttpClient call duration  │  │  · ev.Set("cart.total", ...) │
+│  · EF Core commands          │  │  · ev.Set("payment.*", ...)  │
+│  · gRPC client spans         │  │  · ev.Time("payment.charge") │
+│                              │  │  · Enrichers (HTTP, identity) │
+│  Sets Activity tags:         │  │                               │
+│  · db.system, db.statement   │  │  Emits wide events to sinks: │
+│  · http.method, http.url     │  │  · Console, File, Seq, Kafka │
+│  · etc.                      │  │                               │
+└──────────────┬───────────────┘  └───────────────┬───────────────┘
+               │                                  │
+               └──────────┐  ┌────────────────────┘
+                          ▼  ▼
+               ┌──────────────────────┐
+               │  Vestige.Extensions  │
+               │  .OpenTelemetry      │
+               │                      │
+               │  Reads OTel tags     │
+               │  INTO WideEvent      │
+               │                      │
+               │  Writes Vestige      │
+               │  fields ONTO Activity│
+               └──────────────────────┘
+                          │
+                          ▼
+               Wide event contains BOTH:
+               · db.duration_ms (from OTel)
+               · user.id (from your code)
+               · http.status_code (from OTel)
+               · cart.total_cents (from your code)
+```
 
 ---
 
-## 2. Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                          Your Application                           │
-│                                                                     │
-│   ev.Set("user.id", userId)                                         │
-│   ev.Set("cart.total_cents", 15999)                                 │
-│   using (ev.Time("payment.charge")) { ... }                        │
-│                                                                     │
-├─────────────────────────────────────────────────────────────────────┤
-│                         Vestige Core                                │
-│                                                                     │
-│   WideEvent accumulates all fields in a ConcurrentDictionary        │
-│   Enrichers add fields at request start and end                     │
-│   Tail sampler evaluates keep/drop after request completes          │
-│   Pipeline serializes → dispatches to sinks                         │
-│                                                                     │
-├─────────────────────────────────────────────────────────────────────┤
-│                         Sinks (primary output)                      │
-│                                                                     │
-│   Console · File · Seq · Kafka · EventHubs · RabbitMQ · Custom      │
-│   Each sink receives pre-serialized JSON and writes to its target   │
-│                                                                     │
-├─────────────────────────────────────────────────────────────────────┤
-│              Optional: OTel Activity Sync Extension                  │
-│                                                                     │
-│   Vestige.Extensions.OpenTelemetry syncs WideEvent fields onto      │
-│   Activity.Current as span tags — enriching existing OTel spans     │
-│   with the same business context, no infrastructure changes needed  │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 3. Ecosystem Model
+## 2. Ecosystem Model
 
 Tiny core defining abstractions. Opt-in packages for enrichers, sinks, framework integrations, and OTel sync. Same decomposition pattern as Serilog.
 
@@ -66,8 +73,7 @@ Tiny core defining abstractions. Opt-in packages for enrichers, sinks, framework
 │                        Your Application                         │
 ├─────────────────────────────────────────────────────────────────┤
 │  Vestige.Extensions.AspNetCore                                  │
-│  Vestige.Extensions.HttpClient                                  │
-│  Vestige.Extensions.EntityFrameworkCore                         │
+│  Vestige.Extensions.Hosting                                     │
 │  Vestige.Extensions.OpenTelemetry (optional)                    │
 ├──────────────┬──────────────┬───────────────────────────────────┤
 │  Enrichers   │    Sinks     │  Bridges                          │
@@ -83,37 +89,42 @@ Tiny core defining abstractions. Opt-in packages for enrichers, sinks, framework
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### Why This Matters
+### Design Boundaries
 
-- **Minimal dependency surface** — an app using Console + HttpRequest enricher pulls in 3 tiny packages.
-- **Independent versioning** — a bug fix to the Kafka sink ships without touching core.
-- **Community extensions** — anyone can publish `Vestige.Enrichers.LaunchDarkly` or `Vestige.Sinks.ClickHouse`.
-- **OTel is optional** — you don't need OpenTelemetry to use Vestige. But if you have it, the sync extension makes your spans richer for free.
+| Concern | Owner | Why |
+|---|---|---|
+| Business context (user, cart, payment, flags) | **Vestige** | Only your code knows this |
+| HTTP request/response metadata | **Vestige enrichers** | Extracted from `HttpContext`, part of the wide event workflow |
+| User identity / claims | **Vestige enrichers** | Extracted from `ClaimsPrincipal` |
+| Host / environment info | **Vestige enrichers** | Static info, no DiagnosticSource needed |
+| Trace correlation (trace_id, span_id) | **Vestige enrichers** | Read from `Activity.Current` |
+| DB query timing & details | **OpenTelemetry** | Auto-instrumentation via DiagnosticSource |
+| Outgoing HTTP call timing | **OpenTelemetry** | Auto-instrumentation via DiagnosticSource |
+| gRPC / messaging client spans | **OpenTelemetry** | Auto-instrumentation via DiagnosticSource |
+| Bridging OTel ↔ Vestige | **Vestige.Extensions.OpenTelemetry** | Reads OTel tags in, writes Vestige fields out |
 
 ---
 
-## 4. Package Map
+## 3. Package Map
 
-### 4.1 Core
+### 3.1 Core
 
 | Package | Dependencies | Description |
 |---|---|---|
-| **`Vestige`** | `M.E.DependencyInjection.Abstractions`, `M.E.Options`, `System.Text.Json` | All abstractions (`IWideEventSink`, `IWideEventEnricher`, `ISamplingStrategy`, `IWideEventSerializer`, `IWideEventAccessor`, `IWideEventFactory`, `IWideEventPipeline`, `IWideEventScopeFactory`), the `WideEvent` model, async pipeline engine, `TailSampler`, default JSON serializer, and DI wiring. The only required package. |
+| **`Vestige`** | `M.E.DependencyInjection.Abstractions`, `M.E.Options`, `System.Text.Json` | All abstractions, `WideEvent` model, async pipeline, `TailSampler`, JSON serializer, DI wiring. The only required package. |
 | **`Vestige.Testing`** | `Vestige` | `InMemorySink`, `NullWideEventAccessor`, `TestWideEventAccessor`, `WideEventAssertions`. |
 
-### 4.2 Framework Integrations
+### 3.2 Framework Integrations
 
 | Package | Dependencies | Description |
 |---|---|---|
 | **`Vestige.Extensions.AspNetCore`** | `Vestige`, `M.AspNetCore.Http.Abstractions` | Middleware, `UseVestige()`, scoped accessor. |
-| **`Vestige.Extensions.HttpClient`** | `Vestige`, `M.E.Http` | `DelegatingHandler` that auto-times outgoing calls and writes `http_out.*` fields. |
-| **`Vestige.Extensions.EntityFrameworkCore`** | `Vestige`, `M.EntityFrameworkCore` | `DiagnosticSource` listener that captures `db.*` fields. |
 | **`Vestige.Extensions.Hosting`** | `Vestige`, `M.E.Hosting.Abstractions` | `IWideEventScopeFactory` for background services, pipeline flush on shutdown. |
-| **`Vestige.Extensions.OpenTelemetry`** | `Vestige`, `System.Diagnostics.DiagnosticSource` | Syncs `WideEvent` fields onto `Activity.Current` as span tags. Optional layer for teams with existing OTel pipelines. |
+| **`Vestige.Extensions.OpenTelemetry`** | `Vestige`, `System.Diagnostics.DiagnosticSource` | Bidirectional sync: reads OTel Activity tags into WideEvent, writes Vestige fields onto Activity. |
 
-### 4.3 Enrichers
+### 3.3 Enrichers
 
-Each enricher is its own package. Depends on `Vestige` core plus whatever framework it reads from.
+Enrichers add fields that Vestige can extract **without** `DiagnosticSource` auto-instrumentation — data that comes from `HttpContext`, `ClaimsPrincipal`, `Activity.Current`, `Environment`, or your own services via DI.
 
 | Package | Fields Added |
 |---|---|
@@ -132,14 +143,14 @@ Community examples (not shipped by us):
 | `Vestige.Enrichers.Tenant` | `tenant.id`, `tenant.plan`, `tenant.region` |
 | `Vestige.Enrichers.MassTransit` | `messaging.destination`, `messaging.message_id` |
 
-### 4.4 Sinks
+### 3.4 Sinks
 
-Each sink is its own package. The **primary output path** for Vestige events.
+The **primary output path** for Vestige events.
 
 | Package | Description |
 |---|---|
 | **`Vestige.Sinks.Console`** | JSON to stdout/stderr. Compact or indented. |
-| **`Vestige.Sinks.File`** | JSON lines to rolling files. Max size, retention, async flush. |
+| **`Vestige.Sinks.File`** | JSON lines to rolling files. Max size, retention. |
 | **`Vestige.Sinks.Seq`** | Native Seq CLEF ingestion over HTTP. |
 | **`Vestige.Sinks.Kafka`** | Publish JSON events to Kafka topics. |
 | **`Vestige.Sinks.EventHubs`** | Publish to Azure Event Hubs. |
@@ -153,18 +164,18 @@ Community examples:
 | `Vestige.Sinks.Loki` | Push to Grafana Loki. |
 | `Vestige.Sinks.Elasticsearch` | Index into Elasticsearch/OpenSearch. |
 
-### 4.5 Bridges (Migration Helpers)
+### 3.5 Bridges (Migration Helpers)
 
 | Package | Description |
 |---|---|
-| **`Vestige.Bridges.Serilog`** | Forward Serilog events as fields on the current `WideEvent`. |
+| **`Vestige.Bridges.Serilog`** | Forward Serilog events as fields on the current `WideEvent`. Migration tool for codebases with extensive Serilog usage. |
 | **`Vestige.Bridges.MicrosoftLogging`** | Capture `ILogger` calls on the current wide event. |
 
 ---
 
-## 5. Core Abstractions
+## 4. Core Abstractions
 
-### 5.1 `WideEvent` — The Event Model
+### 4.1 `WideEvent` — The Event Model
 
 ```csharp
 public sealed class WideEvent
@@ -209,13 +220,7 @@ public sealed class WideEvent
 }
 ```
 
-Design notes:
-
-- `ConcurrentDictionary` for thread safety — enrichers can write from different threads.
-- Flat dot-separated keys (`user.id`, `payment.provider`) map directly to columnar store columns.
-- `CaptureException` extracts type, message, code, stack trace into `error.*` fields.
-
-### 5.2 All Interfaces
+### 4.2 All Interfaces
 
 ```csharp
 // --- Event access (DI-based, no statics) ---
@@ -249,7 +254,7 @@ public abstract class WideEventEnricherBase : IWideEventEnricher
     public virtual Task OnBeforeEmitAsync(WideEvent ev, CancellationToken ct) => Task.CompletedTask;
 }
 
-// --- Sinks (primary output — receive pre-serialized JSON) ---
+// --- Sinks (primary output) ---
 public interface IWideEventSink : IAsyncDisposable
 {
     string Name { get; }
@@ -300,7 +305,7 @@ public sealed class WideEventData
 }
 ```
 
-### 5.3 The Builder
+### 4.3 The Builder
 
 ```csharp
 public class VestigeBuilder
@@ -339,45 +344,39 @@ public static class VestigeServiceCollectionExtensions
 }
 ```
 
-All extension packages provide extension methods on `VestigeBuilder`, returning it for chaining.
-
 ---
 
-## 6. Pipeline Execution
+## 5. Pipeline Execution
 
 ```
 Request arrives
 │
-├── 1. Middleware creates WideEvent via IWideEventFactory
-│      Sets it on IWideEventAccessorSetter
-│      Starts Stopwatch
+├── 1. Middleware creates WideEvent, sets on accessor, starts stopwatch
 │
-├── 2. Enrichers.OnEventCreated() — add context available at request start
-│      (HTTP method, path, user claims, trace_id, environment, etc.)
+├── 2. Enrichers.OnEventCreated()
+│      HTTP method/path, user identity, trace_id, environment
+│      (OTel sync: reads existing Activity tags into WideEvent)
 │
 ├── 3. Handler runs — application code calls ev.Set() / ev.Time()
-│      (user.id, cart.total_cents, payment.provider, feature_flags, etc.)
+│      user.id, cart.total_cents, payment.provider, feature_flags, etc.
 │
 ├── 4. Request completes (or throws)
 │      Middleware sets duration_ms, status_code, outcome
 │
-├── 5. Enrichers.OnBeforeEmit() — add context available at request end
-│      (http.bytes_sent, http.content_type, etc.)
+├── 5. Enrichers.OnBeforeEmit()
+│      http.bytes_sent, http.content_type
+│      (OTel sync: writes all Vestige fields onto Activity as tags)
 │
-├── 6. Tail sampling evaluates (keep/drop)
-│      Based on status, duration, business fields
+├── 6. Tail sampling evaluates keep/drop
 │
 ├── 7. If kept:
-│      a. Serialize via IWideEventSerializer → WideEventData (JSON bytes)
-│      b. Dispatch to all registered IWideEventSink instances
-│      c. (Optional) If OTel extension is enabled, sync fields to Activity
+│      a. Serialize → WideEventData (JSON bytes, computed once)
+│      b. Dispatch to all sinks in parallel
 │
-└── 8. Clear WideEvent from accessor
+└── 8. Clear accessor
 ```
 
 ### Batching & Backpressure
-
-The pipeline uses `System.Threading.Channels.Channel<WideEventData>` to decouple production from sink emission:
 
 ```csharp
 builder.Services
@@ -387,28 +386,23 @@ builder.Services
         pipeline.BufferCapacity = 10_000;
         pipeline.BatchSize = 100;
         pipeline.BatchFlushInterval = TimeSpan.FromMilliseconds(500);
-        pipeline.OnBufferFull = BufferFullBehavior.Drop; // Drop | Block | DropOldest
+        pipeline.OnBufferFull = BufferFullBehavior.Drop;
     });
 ```
 
 ---
 
-## 7. Enrichers
+## 6. Enrichers
 
-### 7.1 Interface & Registration
+### 6.1 Interface & Registration
 
 ```csharp
 public interface IWideEventEnricher
 {
-    /// Called at request start. Add context available immediately.
     Task OnEventCreatedAsync(WideEvent wideEvent, CancellationToken ct = default);
-
-    /// Called just before emit. Add context available after processing.
     Task OnBeforeEmitAsync(WideEvent wideEvent, CancellationToken ct = default);
 }
 ```
-
-Registered via extension methods on `VestigeBuilder`:
 
 ```csharp
 builder.Services
@@ -420,16 +414,14 @@ builder.Services
     .AddEnvironmentEnricher();
 ```
 
-### 7.2 Enricher Ordering
-
-Enrichers execute in registration order. Explicit ordering is available:
+### 6.2 Enricher Ordering
 
 ```csharp
 .AddIdentityEnricher(order: 10)
 .AddFeatureFlagEnricher(order: 20)  // runs after identity, can read user.id
 ```
 
-### 7.3 Writing a Custom Enricher
+### 6.3 Writing a Custom Enricher
 
 ```csharp
 // NuGet: Vestige.Enrichers.FeatureFlags
@@ -463,9 +455,9 @@ public static class VestigeBuilderExtensions
 
 ---
 
-## 8. Sinks
+## 7. Sinks
 
-### 8.1 Interface & Registration
+### 7.1 Interface & Registration
 
 ```csharp
 public interface IWideEventSink : IAsyncDisposable
@@ -478,8 +470,6 @@ public interface IWideEventSink : IAsyncDisposable
 }
 ```
 
-Sinks receive `WideEventData` which contains pre-serialized JSON bytes (computed once, shared across all sinks) and the original `WideEvent` for sinks that need raw access.
-
 ```csharp
 builder.Services
     .AddVestige(options => { ... })
@@ -491,7 +481,7 @@ builder.Services
     });
 ```
 
-### 8.2 Writing a Custom Sink
+### 7.2 Writing a Custom Sink
 
 ```csharp
 // NuGet: Vestige.Sinks.EventHubs
@@ -561,9 +551,9 @@ public static class VestigeBuilderExtensions
 
 ---
 
-## 9. Sampling
+## 8. Sampling
 
-### 9.1 Built-In: TailSampler
+### 8.1 Built-In: TailSampler
 
 ```csharp
 builder.Services
@@ -573,14 +563,13 @@ builder.Services
         sampling.AlwaysKeepErrors();
         sampling.AlwaysKeepSlowRequests(thresholdMs: 2000);
         sampling.AlwaysKeepWhen(e => e.Get<string>("user.subscription") == "enterprise");
-        sampling.AlwaysKeepWhen(e => e.Has("feature_flags.new_checkout"));
         sampling.AlwaysKeepPaths("/api/checkout", "/api/payments/*");
         sampling.RateForPath("/healthz", 0.001);
         sampling.DefaultRate(0.05);
     });
 ```
 
-### 9.2 Custom Strategy
+### 8.2 Custom Strategy
 
 ```csharp
 public class AdaptiveSampler : ISamplingStrategy
@@ -600,13 +589,12 @@ public class AdaptiveSampler : ISamplingStrategy
     }
 }
 
-// Registration:
 builder.Services
     .AddVestige(options => { ... })
     .UseSamplingStrategy<AdaptiveSampler>();
 ```
 
-### 9.3 Composable Chain
+### 8.3 Composable Chain
 
 ```csharp
 .UseSamplingStrategy<AlwaysKeepErrorsSampler>()   // Keep or Defer
@@ -616,32 +604,37 @@ builder.Services
 
 ---
 
-## 10. OpenTelemetry Integration (Optional Extension)
+## 9. OpenTelemetry Integration (Optional)
 
-`Vestige.Extensions.OpenTelemetry` is an **optional package** that syncs `WideEvent` fields onto the current `Activity` (OTel span) as tags. This means teams with existing OTel pipelines get richly-tagged spans without changing their collector or backend.
+`Vestige.Extensions.OpenTelemetry` is an optional package that bridges Vestige and OTel bidirectionally.
 
-### 10.1 How It Works
+### 9.1 What It Does
 
-The extension registers an `IWideEventEnricher` that, on `OnBeforeEmit`, copies all `WideEvent` properties to `Activity.Current?.SetTag()`. It can also read existing `Activity` tags into the `WideEvent` at creation time.
+**Reads IN**: At event creation, imports existing `Activity` tags (auto-instrumented by OTel) into the `WideEvent`. DB query timing, outgoing HTTP call details, gRPC metadata — all of it becomes queryable fields on the wide event without you writing any code.
+
+**Writes OUT**: Before emit, copies all `WideEvent` fields onto the `Activity` as span tags. Your OTel backend (Jaeger, Honeycomb, Datadog, Tempo) shows business context on traces.
+
+### 9.2 Implementation
 
 ```csharp
-// Inside the extension:
-public class ActivitySyncEnricher : WideEventEnricherBase
+public class OpenTelemetrySyncEnricher : WideEventEnricherBase
 {
-    private readonly ActivitySyncOptions _options;
+    private readonly OpenTelemetrySyncOptions _options;
 
-    public ActivitySyncEnricher(IOptions<ActivitySyncOptions> options)
+    public OpenTelemetrySyncEnricher(IOptions<OpenTelemetrySyncOptions> options)
         => _options = options.Value;
 
     public override Task OnEventCreatedAsync(WideEvent ev, CancellationToken ct)
     {
-        if (!_options.ReadExistingTags) return Task.CompletedTask;
         var activity = Activity.Current;
-        if (activity is null) return Task.CompletedTask;
+        if (activity is null || !_options.ReadActivityTags) return Task.CompletedTask;
 
-        // Import auto-instrumented tags from OTel into the WideEvent
-        foreach (var tag in activity.Tags)
+        foreach (var tag in activity.TagObjects)
+        {
+            if (_options.ExcludePrefixes.Any(p => tag.Key.StartsWith(p)))
+                continue;
             ev.Set(tag.Key, tag.Value);
+        }
 
         return Task.CompletedTask;
     }
@@ -649,11 +642,14 @@ public class ActivitySyncEnricher : WideEventEnricherBase
     public override Task OnBeforeEmitAsync(WideEvent ev, CancellationToken ct)
     {
         var activity = Activity.Current;
-        if (activity is null) return Task.CompletedTask;
+        if (activity is null || !_options.WriteToActivity) return Task.CompletedTask;
 
-        // Sync all Vestige fields onto the OTel span
         foreach (var (key, value) in ev.Properties)
+        {
+            if (_options.ExcludePrefixes.Any(p => key.StartsWith(p)))
+                continue;
             activity.SetTag(key, value);
+        }
 
         foreach (var (key, ms) in ev.Timings)
             activity.SetTag($"{key}.duration_ms", ms);
@@ -663,53 +659,57 @@ public class ActivitySyncEnricher : WideEventEnricherBase
 }
 ```
 
-### 10.2 Usage
+### 9.3 Usage
 
 ```csharp
 builder.Services
-    .AddVestige(options => { ... })
+    .AddVestige(o => o.ServiceName = "checkout-service")
     .AddHttpRequestEnricher()
-    .AddConsoleSink()                           // primary output: Vestige JSON events
-    .AddOpenTelemetrySync(o =>                  // optional: also enrich OTel spans
+    .AddConsoleSink()
+    .AddOpenTelemetrySync(o =>
     {
-        o.ReadExistingTags = true;              // import OTel auto-instrumented tags
-        o.SyncToActivity = true;                // write Vestige fields to Activity
-        o.ExcludePrefixes = ["internal."];       // don't sync internal fields
+        o.ReadActivityTags = true;          // import OTel auto-instrumented data
+        o.WriteToActivity = true;           // enrich OTel spans with Vestige fields
+        o.ExcludePrefixes = ["internal."];  // don't sync internal fields
     });
 ```
 
-### 10.3 What This Gives You
+### 9.4 Result
 
-Without changing any OTel infrastructure, your spans now carry all the Vestige business context:
+Wide event now contains fields from **both** Vestige and OTel auto-instrumentation:
 
+```json
+{
+  "service": "checkout-service",
+  "duration_ms": 1247,
+  "outcome": "success",
+
+  "user.id": "user_789",
+  "user.subscription": "premium",
+  "cart.total_cents": 16000,
+  "payment.provider": "stripe",
+  "payment.charge.duration_ms": 1089,
+  "feature_flags.new_checkout": true,
+
+  "db.system": "postgresql",
+  "db.statement": "SELECT * FROM carts WHERE user_id = $1",
+  "db.duration_ms": 47,
+  "http.url": "https://api.stripe.com/v1/charges",
+  "http.status_code": 200
+}
 ```
-OTel span BEFORE Vestige:                OTel span AFTER Vestige:
-├── http.method: POST                    ├── http.method: POST
-├── http.route: /api/checkout            ├── http.route: /api/checkout
-├── http.status_code: 200                ├── http.status_code: 200
-└── duration: 1247ms                     ├── duration: 1247ms
-                                         ├── user.id: user_789
-                                         ├── user.subscription: premium
-                                         ├── cart.total_cents: 16000
-                                         ├── cart.item_count: 3
-                                         ├── payment.provider: stripe
-                                         ├── payment.attempt: 3
-                                         ├── payment.charge.duration_ms: 1089
-                                         ├── feature_flags.new_checkout: true
-                                         └── error.code: card_declined
-```
 
-Your OTel backend (Jaeger, Honeycomb, Datadog, Tempo) now lets you query spans using Vestige's business fields — without any changes to your collector pipeline.
+Business context (top half) from Vestige. Infrastructure details (bottom half) imported from OTel. One event, complete picture.
 
-### 10.4 Important: Vestige Is Not an OTel Replacement
+### 9.5 Without OTel
 
-The OTel sync extension is purely additive. Vestige's primary job is emitting wide events to sinks. The Activity sync is a bonus for teams that also use OTel. You can use Vestige without OTel, OTel without Vestige, or both together.
+Vestige works standalone. If you don't use OTel, you just don't install the extension. Your wide events contain whatever your enrichers and `ev.Set()` calls provide. You can always add OTel + the sync extension later.
 
 ---
 
-## 11. Dependency Injection — No Statics
+## 10. Dependency Injection — No Statics
 
-### 11.1 Accessing the Current Event
+### 10.1 Accessing the Current Event
 
 ```csharp
 public class CheckoutService
@@ -742,7 +742,7 @@ public class CheckoutService
 }
 ```
 
-### 11.2 Background Jobs
+### 10.2 Background Jobs
 
 ```csharp
 public class OrderProcessor : BackgroundService
@@ -771,7 +771,6 @@ public class OrderProcessor : BackgroundService
                 ev.Outcome = "error";
                 ev.CaptureException(ex);
             }
-            // Event auto-emitted on dispose
         }
     }
 }
@@ -779,7 +778,7 @@ public class OrderProcessor : BackgroundService
 
 ---
 
-## 12. ASP.NET Core Middleware
+## 11. ASP.NET Core Middleware
 
 ```csharp
 public class WideEventMiddleware
@@ -827,7 +826,7 @@ public class WideEventMiddleware
 
 ---
 
-## 13. Extension Package Conventions
+## 12. Extension Package Conventions
 
 Every extension package follows the same pattern:
 
@@ -836,7 +835,7 @@ Every extension package follows the same pattern:
 3. Use `IOptions<T>` for configuration.
 4. Support constructor injection.
 5. Return `VestigeBuilder` for chaining.
-6. Follow naming: `Vestige.{Category}.{Name}`, method: `Add{Name}{Category}()` or `Add{Name}()`.
+6. Follow naming: `Vestige.{Category}.{Name}`.
 
 ### Enricher Package Structure
 
@@ -858,9 +857,7 @@ Vestige.Sinks.Kafka/
 
 ---
 
-## 14. Testing
-
-### 14.1 `Vestige.Testing` Package
+## 13. Testing
 
 ```csharp
 // Integration test
@@ -883,17 +880,14 @@ await client.PostAsync("/checkout", content);
 var ev = sink.Events.Single();
 Assert.Equal(200, ev.Get<int>("http.status_code"));
 Assert.Equal("user_123", ev.Get<string>("user.id"));
-
-// Fluent assertions helper
 ev.Should().HaveField("cart.total_cents", 15999);
-ev.Should().HaveTimingGreaterThan("payment.charge", TimeSpan.Zero);
 ev.Should().HaveOutcome("success");
 ```
 
 ```csharp
-// Unit test — no event scope, enrichment is silently ignored
+// Unit test — no event scope, ev?.Set() is a no-op
 var service = new CheckoutService(new NullWideEventAccessor(), mockPayments.Object);
-await service.ProcessAsync(cart, user); // ev?.Set() is a no-op
+await service.ProcessAsync(cart, user);
 ```
 
 ```csharp
@@ -906,7 +900,7 @@ Assert.Equal("premium", accessor.Current!.Get<string>("user.subscription"));
 
 ---
 
-## 15. Solution & Repository Structure
+## 14. Solution & Repository Structure
 
 ```
 vestige/
@@ -915,10 +909,8 @@ vestige/
 │   ├── Vestige.Testing/                          # Test helpers
 │   │
 │   ├── Vestige.Extensions.AspNetCore/            # Middleware
-│   ├── Vestige.Extensions.HttpClient/            # Outgoing HTTP handler
-│   ├── Vestige.Extensions.EntityFrameworkCore/   # EF Core diagnostic listener
 │   ├── Vestige.Extensions.Hosting/               # Background service support
-│   ├── Vestige.Extensions.OpenTelemetry/         # Optional Activity sync
+│   ├── Vestige.Extensions.OpenTelemetry/         # Bidirectional Activity sync
 │   │
 │   ├── Vestige.Enrichers.HttpRequest/
 │   ├── Vestige.Enrichers.HttpResponse/
@@ -945,9 +937,9 @@ vestige/
 │   └── Vestige.IntegrationTests/
 │
 ├── samples/
-│   ├── Vestige.Samples.WebApi/                   # Minimal API example
-│   ├── Vestige.Samples.Worker/                   # Background service example
-│   └── Vestige.Samples.WithOpenTelemetry/        # OTel + Vestige together
+│   ├── Vestige.Samples.WebApi/                   # Minimal API + Console sink
+│   ├── Vestige.Samples.Worker/                   # Background service
+│   └── Vestige.Samples.WithOpenTelemetry/        # Vestige + OTel together
 │
 ├── docs/
 │   ├── getting-started.md
@@ -965,7 +957,7 @@ vestige/
 
 ---
 
-## 16. Implementation Phases
+## 15. Implementation Phases
 
 ### Phase 1 — Core + Console Sink + Essentials
 
@@ -977,9 +969,9 @@ vestige/
 
 **Packages**: `Vestige.Sinks.File`, `Vestige.Sinks.Seq`, `Vestige.Sinks.Kafka`, `Vestige.Sinks.EventHubs`.
 
-### Phase 3 — Framework Integrations & OTel
+### Phase 3 — OTel Integration & Identity
 
-**Packages**: `Vestige.Extensions.HttpClient`, `Vestige.Extensions.EntityFrameworkCore`, `Vestige.Extensions.OpenTelemetry`, `Vestige.Enrichers.Identity`, `Vestige.Enrichers.Thread`.
+**Packages**: `Vestige.Extensions.OpenTelemetry`, `Vestige.Enrichers.Identity`, `Vestige.Enrichers.Thread`.
 
 ### Phase 4 — Bridges & Polish
 

@@ -72,8 +72,8 @@ app.MapPost("/orders", ([FromBody] CreateOrderRequest req, [FromServices] IWideE
                .Set("order.quantity", req.Quantity)
                .Set("customer.id", req.CustomerId);
 
-    // Demonstrate sub-timer
-    using (ev.Current?.Time("db.insert")) { Thread.Sleep(10); }
+    // Demonstrate sub-scope (fields + duration stamped under "db.insert.*")
+    using (ev.Current?.Scope("db.insert")) { Thread.Sleep(10); }
 
     var order = new { Id = 42, req.Product, req.Quantity, req.CustomerId };
     ev.Current?.Set("order.id", order.Id);
@@ -133,7 +133,7 @@ sealed class OrderProcessingJob(IWideEventScopeFactory vestige, ILogger<OrderPro
         {
             ev.Set("job.batch_size", 10);
 
-            using (ev.Time("db.fetch"))
+            using (ev.Scope("db.fetch"))
             {
                 await Task.Delay(5, cancellationToken); // simulate DB read
             }

@@ -1,5 +1,4 @@
 using System.Collections.Concurrent;
-using System.Diagnostics;
 
 namespace Vestige;
 
@@ -10,10 +9,13 @@ namespace Vestige;
 public sealed class WideEvent
 {
     private readonly ConcurrentDictionary<string, object?> _properties = new(StringComparer.Ordinal);
-    private readonly ConcurrentDictionary<string, long> _timings = new(StringComparer.Ordinal);
 
     /// <summary>Unique identifier for this event.</summary>
-    public string EventId { get; } = Guid.NewGuid().ToString("N");
+#if NET9_0_OR_GREATER
+    public Guid EventId { get; } = Guid.CreateVersion7();
+#else
+    public Guid EventId { get; } = Guid.NewGuid();
+#endif
 
     /// <summary>UTC timestamp when this event was created.</summary>
     public DateTimeOffset Timestamp { get; } = DateTimeOffset.UtcNow;
@@ -70,24 +72,40 @@ public sealed class WideEvent
     /// <summary>Snapshot of all dynamic properties.</summary>
     public IReadOnlyDictionary<string, object?> Properties => _properties;
 
-    // ── Sub-timers ────────────────────────────────────────────────────────────
+    // ── Scopes ────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Start a named timer. Dispose the returned handle to record elapsed milliseconds
-    /// under the key <c>timer.{operationName}</c>.
+    /// Start a named scope. All fields set on the returned <see cref="ScopedWideEvent"/>
+    /// are written as <c>{name}.{key}</c> on this event. Disposing the scope records
+    /// <c>{name}.duration_ms</c> with the elapsed wall-clock time.
     /// </summary>
-    public IDisposable Time(string operationName)
-    {
-        var sw = Stopwatch.StartNew();
-        return new TimerHandle(() =>
-        {
-            sw.Stop();
-            _timings.AddOrUpdate(operationName, sw.ElapsedMilliseconds, (_, prev) => prev + sw.ElapsedMilliseconds);
-        });
-    }
+    /// <example>
+    /// Disposable form (works with async):
+    /// <code>
+    /// using var payment = ev.Scope("payment.charge");
+    /// payment.Set("provider", "stripe");
+    /// await _gateway.ChargeAsync();
+    /// // → payment.charge.provider = "stripe", payment.charge.duration_ms = …
+    /// </code>
+    /// </example>
+    public ScopedWideEvent Scope(string name) => new(this, name);
 
-    /// <summary>Snapshot of all recorded timer durations (ms).</summary>
-    public IReadOnlyDictionary<string, long> Timings => _timings;
+    /// <summary>
+    /// Execute <paramref name="action"/> inside a named scope and record its
+    /// duration automatically when the action returns.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// ev.Scope("db.fetch", s => s.Set("table", "orders"));
+    /// // → db.fetch.table = "orders", db.fetch.duration_ms = …
+    /// </code>
+    /// </example>
+    public WideEvent Scope(string name, Action<ScopedWideEvent> action)
+    {
+        using var scope = new ScopedWideEvent(this, name);
+        action(scope);
+        return this;
+    }
 
     // ── Error capture ─────────────────────────────────────────────────────────
 
@@ -106,15 +124,4 @@ public sealed class WideEvent
         return this;
     }
 
-    // ── Private helpers ───────────────────────────────────────────────────────
-
-    private sealed class TimerHandle(Action onDispose) : IDisposable
-    {
-        private int _disposed;
-        public void Dispose()
-        {
-            if (Interlocked.Exchange(ref _disposed, 1) == 0)
-                onDispose();
-        }
-    }
 }

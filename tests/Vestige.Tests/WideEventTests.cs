@@ -55,23 +55,36 @@ public sealed class WideEventTests
     }
 
     [Fact]
-    public void Time_RecordsTiming()
+    public void Scope_RecordsDurationMs()
     {
         var ev = new WideEvent();
-        using (ev.Time("db.query"))
-        {
-            // Minimal work
-        }
-        Assert.True(ev.Timings.ContainsKey("db.query"));
+        using (ev.Scope("db.query")) { /* minimal work */ }
+        Assert.True(ev.Has("db.query.duration_ms"));
+        Assert.True(ev.Get<double>("db.query.duration_ms") >= 0);
     }
 
     [Fact]
-    public async Task Time_AccumulatesMultipleCalls()
+    public void Scope_SetsFieldsUnderPrefix()
     {
         var ev = new WideEvent();
-        using (ev.Time("op")) { await Task.Delay(10); }
-        using (ev.Time("op")) { await Task.Delay(10); }
-        Assert.True(ev.Timings["op"] >= 0); // at least recorded
+        ev.Scope("payment", s =>
+        {
+            s.Set("provider", "stripe");
+            s.Set("attempt", 1);
+        });
+        Assert.Equal("stripe", ev.Get<string>("payment.provider"));
+        Assert.Equal(1, ev.Get<int>("payment.attempt"));
+        Assert.True(ev.Has("payment.duration_ms"));
+    }
+
+    [Fact]
+    public void Scope_Nested_PrefixesCombine()
+    {
+        var ev = new WideEvent();
+        using var checkout = ev.Scope("checkout");
+        checkout.Scope("validation", s => s.Set("rules_run", 4));
+        Assert.Equal(4, ev.Get<int>("checkout.validation.rules_run"));
+        Assert.True(ev.Has("checkout.validation.duration_ms"));
     }
 
     [Fact]

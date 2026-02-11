@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <!-- Opt out of multi-targeting — sample runs on a single TFM -->
+    <TargetFrameworks />
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- OpenTelemetry SDK -->
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.Http" />
+    <PackageReference Include="OpenTelemetry.Exporter.Console" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Vestige packages -->
+    <ProjectReference Include="..\..\src\Vestige\Vestige.csproj" />
+    <ProjectReference Include="..\..\src\Vestige.Sinks.Console\Vestige.Sinks.Console.csproj" />
+    <ProjectReference Include="..\..\src\Vestige.Extensions.AspNetCore\Vestige.Extensions.AspNetCore.csproj" />
+    <ProjectReference Include="..\..\src\Vestige.Extensions.Hosting\Vestige.Extensions.Hosting.csproj" />
+    <ProjectReference Include="..\..\src\Vestige.Extensions.OpenTelemetry\Vestige.Extensions.OpenTelemetry.csproj" />
+    <ProjectReference Include="..\..\src\Vestige.Enrichers.Environment\Vestige.Enrichers.Environment.csproj" />
+    <ProjectReference Include="..\..\src\Vestige.Enrichers.Activity\Vestige.Enrichers.Activity.csproj" />
+    <ProjectReference Include="..\..\src\Vestige.Enrichers.HttpRequest\Vestige.Enrichers.HttpRequest.csproj" />
+    <ProjectReference Include="..\..\src\Vestige.Enrichers.HttpResponse\Vestige.Enrichers.HttpResponse.csproj" />
+  </ItemGroup>
+
+</Project>

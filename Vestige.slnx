@@ -1,14 +1,26 @@
 <Solution>
+  <Folder Name="/build/">
+    <File Path="Directory.Build.props" />
+    <File Path="Directory.Packages.props" />
+  </Folder>
+  <Folder Name="/docs/">
+    <File Path="README.md" />
+    <File Path="vestige-architecture-plan.md" />
+  </Folder>
   <Folder Name="/samples/">
     <Project Path="samples/Vestige.Sample/Vestige.Sample.csproj" />
+    <Project Path="samples/Vestige.Sample.WithOpenTelemetry/Vestige.Sample.WithOpenTelemetry.csproj" />
   </Folder>
   <Folder Name="/src/">
     <Project Path="src/Vestige.Enrichers.Activity/Vestige.Enrichers.Activity.csproj" />
     <Project Path="src/Vestige.Enrichers.Environment/Vestige.Enrichers.Environment.csproj" />
     <Project Path="src/Vestige.Enrichers.HttpRequest/Vestige.Enrichers.HttpRequest.csproj" />
     <Project Path="src/Vestige.Enrichers.HttpResponse/Vestige.Enrichers.HttpResponse.csproj" />
+    <Project Path="src/Vestige.Enrichers.Identity/Vestige.Enrichers.Identity.csproj" />
+    <Project Path="src/Vestige.Enrichers.Thread/Vestige.Enrichers.Thread.csproj" />
     <Project Path="src/Vestige.Extensions.AspNetCore/Vestige.Extensions.AspNetCore.csproj" />
     <Project Path="src/Vestige.Extensions.Hosting/Vestige.Extensions.Hosting.csproj" />
+    <Project Path="src/Vestige.Extensions.OpenTelemetry/Vestige.Extensions.OpenTelemetry.csproj" />
     <Project Path="src/Vestige.Sinks.Console/Vestige.Sinks.Console.csproj" />
     <Project Path="src/Vestige.Testing/Vestige.Testing.csproj" />
     <Project Path="src/Vestige/Vestige.csproj" />
