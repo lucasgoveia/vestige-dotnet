@@ -83,14 +83,25 @@ internal sealed class WideEventPipeline : IWideEventPipeline, IHostedService, IA
     public async Task StopAsync(CancellationToken cancellationToken)
     {
         _channel.Writer.Complete();
-        await _cts.CancelAsync().ConfigureAwait(false);
 
         try
         {
-            // Drain the channel before shutting down
-            await _consumerTask.ConfigureAwait(false);
+            // Drain buffered events while the host shutdown deadline still allows it.
+            await _consumerTask.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) { /* expected */ }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            await _cts.CancelAsync().ConfigureAwait(false);
+
+            try
+            {
+                await _consumerTask.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // Forced shutdown path.
+            }
+        }
 
         foreach (var sink in _sinks)
         {
@@ -192,7 +203,7 @@ internal sealed class WideEventPipeline : IWideEventPipeline, IHostedService, IA
 
         async Task FlushBatchAsync(List<WideEventData> targetBatch)
         {
-            await DispatchBatchAsync(targetBatch, CancellationToken.None).ConfigureAwait(false);
+            await DispatchBatchAsync(targetBatch, cancellationToken).ConfigureAwait(false);
             targetBatch.Clear();
             batchStartedAt = null;
         }

@@ -119,4 +119,53 @@ public sealed class WideEventPipelineTests
 
         await pipeline.StopAsync(cancellationToken);
     }
+
+    [Fact]
+    public async Task StopAsync_DrainsBufferedEvents_WhenShutdownTokenHasNotExpired()
+    {
+        var sink = new CancellationTrackingSink();
+        var pipeline = BuildPipeline(
+            [sink],
+            options: new PipelineOptions
+            {
+                BatchSize = 1,
+                BatchFlushInterval = TimeSpan.FromSeconds(30),
+            });
+
+        await pipeline.StartAsync(CancellationToken.None);
+        await pipeline.EmitAsync(new WideEvent { Outcome = "success" });
+        await sink.Started.Task.WaitAsync(TestContext.Current.CancellationToken);
+
+        var stopTask = pipeline.StopAsync(new CancellationTokenSource(TimeSpan.FromSeconds(5)).Token);
+
+        Assert.False(stopTask.IsCompleted);
+        Assert.False(sink.EmitCancellationToken.IsCancellationRequested);
+
+        sink.Release.TrySetResult();
+        await stopTask;
+
+        Assert.Equal(1, sink.EmitCount);
+        Assert.False(sink.EmitCancellationToken.IsCancellationRequested);
+        Assert.Equal(1, sink.FlushCount);
+    }
+
+    private sealed class CancellationTrackingSink : IWideEventSink
+    {
+        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public CancellationToken EmitCancellationToken { get; private set; }
+        public int EmitCount { get; private set; }
+        public int FlushCount { get; private set; }
+        public Task InitializeAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public Task EmitAsync(WideEventData data, CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public async Task EmitBatchAsync(IReadOnlyList<WideEventData> batch, CancellationToken cancellationToken = default)
+        {
+            EmitCount++;
+            EmitCancellationToken = cancellationToken;
+            Started.TrySetResult();
+            await Release.Task.WaitAsync(cancellationToken);
+        }
+        public Task FlushAsync(CancellationToken cancellationToken = default) { FlushCount++; return Task.CompletedTask; }
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
 }
