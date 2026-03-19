@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>Vestige.Sinks.Postgres</PackageId>
+    <Description>PostgreSQL sink for Vestige wide event logging.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Vestige\Vestige.csproj" />
+    <PackageReference Include="Npgsql" />
+  </ItemGroup>
+
+</Project>

@@ -10,6 +10,7 @@
     <Project Path="src/Vestige.Extensions.AspNetCore/Vestige.Extensions.AspNetCore.csproj" />
     <Project Path="src/Vestige.Extensions.Hosting/Vestige.Extensions.Hosting.csproj" />
     <Project Path="src/Vestige.Sinks.Console/Vestige.Sinks.Console.csproj" />
+    <Project Path="src/Vestige.Sinks.Postgres/Vestige.Sinks.Postgres.csproj" />
     <Project Path="src/Vestige.Testing/Vestige.Testing.csproj" />
     <Project Path="src/Vestige/Vestige.csproj" />
   </Folder>

@@ -28,6 +28,7 @@
     <ProjectReference Include="..\..\src\Vestige\Vestige.csproj" />
     <ProjectReference Include="..\..\src\Vestige.Testing\Vestige.Testing.csproj" />
     <ProjectReference Include="..\..\src\Vestige.Sinks.Console\Vestige.Sinks.Console.csproj" />
+    <ProjectReference Include="..\..\src\Vestige.Sinks.Postgres\Vestige.Sinks.Postgres.csproj" />
   </ItemGroup>
 
   <ItemGroup>

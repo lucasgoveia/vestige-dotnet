@@ -94,4 +94,29 @@ public sealed class WideEventPipelineTests
         Assert.Single(sink1.Events);
         Assert.Single(sink2.Events);
     }
+
+    [Fact]
+    public async Task PartialBatch_FlushesOnConfiguredInterval()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var sink = new InMemorySink();
+        var pipeline = BuildPipeline(
+            [sink],
+            options: new PipelineOptions
+            {
+                BatchSize = 10,
+                BatchFlushInterval = TimeSpan.FromMilliseconds(50),
+            });
+
+        await pipeline.StartAsync(cancellationToken);
+
+        var ev = new WideEvent { Outcome = "success" };
+        await pipeline.EmitAsync(ev, cancellationToken);
+
+        await Task.Delay(TimeSpan.FromMilliseconds(200), cancellationToken);
+
+        Assert.Single(sink.Events);
+
+        await pipeline.StopAsync(cancellationToken);
+    }
 }

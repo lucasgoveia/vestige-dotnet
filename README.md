@@ -78,6 +78,7 @@ dotnet add package Vestige.Enrichers.HttpRequest
 dotnet add package Vestige.Enrichers.HttpResponse
 dotnet add package Vestige.Enrichers.Environment
 dotnet add package Vestige.Sinks.Console
+dotnet add package Vestige.Sinks.Postgres
 ```
 
 ### Configure
@@ -189,10 +190,28 @@ The `?.` null-conditional pattern means this code works cleanly even in unit tes
 | Package | Description |
 |---|---|
 | [`Vestige.Sinks.Console`](src/Vestige.Sinks.Console) | JSON to stdout. Compact or indented. |
+| [`Vestige.Sinks.Postgres`](src/Vestige.Sinks.Postgres) | PostgreSQL persistence with single-row inserts for one event, `COPY` for batches, and full `jsonb` payload storage. |
 | [`Vestige.Sinks.File`](src/Vestige.Sinks.File) | JSON lines to rolling files. |
 | [`Vestige.Sinks.Seq`](src/Vestige.Sinks.Seq) | Native Seq CLEF ingestion. |
 | [`Vestige.Sinks.Kafka`](src/Vestige.Sinks.Kafka) | Publish events to Kafka. |
 | [`Vestige.Sinks.EventHubs`](src/Vestige.Sinks.EventHubs) | Publish events to Azure Event Hubs. |
+
+Example PostgreSQL configuration:
+
+```csharp
+builder.Services
+    .AddVestige(options =>
+    {
+        options.ServiceName = "checkout-service";
+        options.ServiceVersion = "2.4.1";
+    })
+    .AddPostgresSink(options =>
+    {
+        options.ConnectionString = builder.Configuration.GetConnectionString("Vestige")!;
+        options.Schema = "vestige";
+        options.Table = "wide_events";
+    });
+```
 
 ### Bridges
 

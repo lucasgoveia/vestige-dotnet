@@ -11,7 +11,7 @@ public sealed class PipelineOptions
 
     /// <summary>
     /// Maximum time to wait before flushing a partial batch.
-    /// Default: 500 ms. (Phase 1: timer not implemented; flushes on batch-full or shutdown only.)
+    /// Default: 500 ms.
     /// </summary>
     public TimeSpan BatchFlushInterval { get; set; } = TimeSpan.FromMilliseconds(500);
 

@@ -108,32 +108,94 @@ internal sealed class WideEventPipeline : IWideEventPipeline, IHostedService, IA
     private async Task ConsumeAsync(CancellationToken cancellationToken)
     {
         var batch = new List<WideEventData>(_options.BatchSize);
+        DateTimeOffset? batchStartedAt = null;
 
-        await foreach (var ev in _channel.Reader.ReadAllAsync(CancellationToken.None).ConfigureAwait(false))
+        while (await _channel.Reader.WaitToReadAsync(CancellationToken.None).ConfigureAwait(false))
+        {
+            while (_channel.Reader.TryRead(out var ev))
+            {
+                ProcessEvent(ev, batch, ref batchStartedAt, cancellationToken);
+
+                if (batch.Count >= _options.BatchSize)
+                    await FlushBatchAsync(batch).ConfigureAwait(false);
+            }
+
+            while (batch.Count > 0 && batch.Count < _options.BatchSize)
+            {
+                var startedAt = batchStartedAt ?? DateTimeOffset.UtcNow;
+                var remaining = _options.BatchFlushInterval - (DateTimeOffset.UtcNow - startedAt);
+                if (remaining <= TimeSpan.Zero)
+                {
+                    await FlushBatchAsync(batch).ConfigureAwait(false);
+                    break;
+                }
+
+                try
+                {
+                    var waitToReadTask = _channel.Reader.WaitToReadAsync(CancellationToken.None).AsTask();
+                    var delayTask = Task.Delay(remaining, cancellationToken);
+                    var completedTask = await Task.WhenAny(waitToReadTask, delayTask).ConfigureAwait(false);
+
+                    if (completedTask == delayTask)
+                    {
+                        await FlushBatchAsync(batch).ConfigureAwait(false);
+                        break;
+                    }
+
+                    if (!await waitToReadTask.ConfigureAwait(false))
+                        break;
+
+                    while (batch.Count < _options.BatchSize && _channel.Reader.TryRead(out var ev))
+                    {
+                        ProcessEvent(ev, batch, ref batchStartedAt, cancellationToken);
+
+                        if (batch.Count >= _options.BatchSize)
+                        {
+                            await FlushBatchAsync(batch).ConfigureAwait(false);
+                            break;
+                        }
+                    }
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    await FlushBatchAsync(batch).ConfigureAwait(false);
+                    break;
+                }
+            }
+        }
+
+        if (batch.Count > 0)
+            await FlushBatchAsync(batch).ConfigureAwait(false);
+
+        return;
+
+        void ProcessEvent(
+            WideEvent ev,
+            List<WideEventData> targetBatch,
+            ref DateTimeOffset? startedAt,
+            CancellationToken processingCancellationToken)
         {
             try
             {
                 if (_sampler.Evaluate(ev) == SamplingDecision.Drop)
-                    continue;
+                    return;
 
                 var data = _serializer.Serialize(ev);
-                batch.Add(data);
-
-                if (batch.Count >= _options.BatchSize)
-                {
-                    await DispatchBatchAsync(batch, cancellationToken).ConfigureAwait(false);
-                    batch.Clear();
-                }
+                targetBatch.Add(data);
+                startedAt ??= DateTimeOffset.UtcNow;
             }
-            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+            catch (Exception ex) when (!processingCancellationToken.IsCancellationRequested)
             {
                 _logger.LogError(ex, "Error processing wide event.");
             }
         }
 
-        // Flush remaining
-        if (batch.Count > 0)
-            await DispatchBatchAsync(batch, CancellationToken.None).ConfigureAwait(false);
+        async Task FlushBatchAsync(List<WideEventData> targetBatch)
+        {
+            await DispatchBatchAsync(targetBatch, CancellationToken.None).ConfigureAwait(false);
+            targetBatch.Clear();
+            batchStartedAt = null;
+        }
     }
 
     private async Task DispatchBatchAsync(List<WideEventData> batch, CancellationToken cancellationToken)
