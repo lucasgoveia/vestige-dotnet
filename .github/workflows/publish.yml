@@ -36,6 +36,7 @@ jobs:
           dotnet pack src/Vestige.Extensions.Hosting       --configuration Release --no-build --output ./nupkgs -p:PackageVersion=${{ env.VERSION }}
           dotnet pack src/Vestige.Sinks.Console            --configuration Release --no-build --output ./nupkgs -p:PackageVersion=${{ env.VERSION }}
           dotnet pack src/Vestige.Sinks.Postgres           --configuration Release --no-build --output ./nupkgs -p:PackageVersion=${{ env.VERSION }}
+          dotnet pack src/Vestige.Sinks.SqlServer          --configuration Release --no-build --output ./nupkgs -p:PackageVersion=${{ env.VERSION }}
           dotnet pack src/Vestige.Testing                  --configuration Release --no-build --output ./nupkgs -p:PackageVersion=${{ env.VERSION }}
 
       - name: Push to NuGet.org
