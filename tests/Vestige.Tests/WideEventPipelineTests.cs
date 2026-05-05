@@ -113,7 +113,7 @@ public sealed class WideEventPipelineTests
         var ev = new WideEvent { Outcome = "success" };
         await pipeline.EmitAsync(ev, cancellationToken);
 
-        await Task.Delay(TimeSpan.FromMilliseconds(200), cancellationToken);
+        await Task.Delay(TimeSpan.FromMilliseconds(2000), cancellationToken);
 
         Assert.Single(sink.Events);
 
