@@ -20,7 +20,7 @@ internal sealed class SqlServerWriter : ISqlServerWriter
 
     public async Task EnsureStorageAsync(CancellationToken cancellationToken)
     {
-        var connection = GetConnection();
+        var connection = await GetOpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         var options = _options ?? throw new InvalidOperationException("Sink options have not been initialized.");
 
         var schema = QuoteIdentifier(options.Schema);
@@ -82,7 +82,7 @@ internal sealed class SqlServerWriter : ISqlServerWriter
     {
         ArgumentNullException.ThrowIfNull(row);
 
-        var connection = GetConnection();
+        var connection = await GetOpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         var options = _options ?? throw new InvalidOperationException("Sink options have not been initialized.");
 
         var sql =
@@ -116,7 +116,7 @@ internal sealed class SqlServerWriter : ISqlServerWriter
         if (batch.Count == 0)
             return;
 
-        var connection = GetConnection();
+        var connection = await GetOpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         var options = _options ?? throw new InvalidOperationException("Sink options have not been initialized.");
 
         using var bulkCopy = new SqlBulkCopy(connection);
@@ -147,8 +147,18 @@ internal sealed class SqlServerWriter : ISqlServerWriter
             await _connection.DisposeAsync().ConfigureAwait(false);
     }
 
-    private SqlConnection GetConnection()
-        => _connection ?? throw new ObjectDisposedException(nameof(SqlServerWriter));
+    private async Task<SqlConnection> GetOpenConnectionAsync(CancellationToken cancellationToken)
+    {
+        var connection = _connection ?? throw new ObjectDisposedException(nameof(SqlServerWriter));
+
+        if (connection.State == ConnectionState.Broken)
+            connection.Close();
+
+        if (connection.State != ConnectionState.Open)
+            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+
+        return connection;
+    }
 
     private static DataTable BuildDataTable(IReadOnlyList<SqlServerEventRow> batch)
     {
