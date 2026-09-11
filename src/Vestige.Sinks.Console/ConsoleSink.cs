@@ -19,7 +19,7 @@ public sealed class ConsoleSink : IWideEventSink
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly byte[] _buffer;
     private int _buffered;
-    private bool _disposed;
+    private int _disposed;
 
     public ConsoleSink(IOptions<ConsoleSinkOptions> options)
         : this(options, System.Console.OpenStandardOutput())
@@ -94,9 +94,8 @@ public sealed class ConsoleSink : IWideEventSink
     /// <inheritdoc/>
     public async ValueTask DisposeAsync()
     {
-        if (_disposed)
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
-        _disposed = true;
 
         try { await FlushAsync(CancellationToken.None).ConfigureAwait(false); }
         catch { /* best-effort */ }

@@ -69,7 +69,17 @@ internal sealed class SqlServerEventRow
     /// "String or binary data would be truncated".
     /// </summary>
     private static string? Truncate(string? value, int maxLength)
-        => value is null || value.Length <= maxLength ? value : value[..maxLength];
+    {
+        if (value is null || value.Length <= maxLength)
+            return value;
+
+        // Never split a surrogate pair: the orphaned half would reach the column as a lone
+        // surrogate rather than the character it came from.
+        if (maxLength > 0 && char.IsHighSurrogate(value[maxLength - 1]))
+            maxLength--;
+
+        return value[..maxLength];
+    }
 
     private static string GetRequiredString(IReadOnlyDictionary<string, object?> fields, string key)
         => GetOptionalString(fields, key)

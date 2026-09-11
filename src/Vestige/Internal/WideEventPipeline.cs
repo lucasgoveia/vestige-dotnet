@@ -181,8 +181,12 @@ internal sealed class WideEventPipeline : IWideEventPipeline, IHostedService, IA
 
             while (batch.Count < _options.BatchSize && reader.TryRead(out var ev))
             {
+                // Stamp the deadline only on the empty-to-first transition. Testing `Count == 1`
+                // after every read would restamp it for each sampled-out event arriving behind a
+                // batch already holding exactly one, postponing that event's flush indefinitely.
+                var wasEmpty = batch.Count == 0;
                 ProcessEvent(ev, batch);
-                if (batch.Count == 1)
+                if (wasEmpty && batch.Count == 1)
                     batchStartedAt = Stopwatch.GetTimestamp();
             }
 

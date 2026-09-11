@@ -43,7 +43,9 @@ internal sealed class SystemTextJsonSerializer : IWideEventSerializer
         var buffer = t_buffer ??= new ArrayBufferWriter<byte>(initialCapacity: 4096);
         var writer = t_writer ??= new Utf8JsonWriter(buffer);
 
-        buffer.Clear();
+        // ResetWrittenCount, not Clear: Clear also zeroes the whole backing array, which is pure
+        // overhead per event once the buffer has grown.
+        buffer.ResetWrittenCount();
         writer.Reset(buffer);
 
         writer.WriteStartObject();

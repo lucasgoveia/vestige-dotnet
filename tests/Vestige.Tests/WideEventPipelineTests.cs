@@ -366,6 +366,40 @@ public sealed class WideEventPipelineTests
         Assert.False(sink.FlushCancellationToken.IsCancellationRequested);
     }
 
+    [Fact]
+    public async Task PartialBatch_FlushDeadlineSurvivesASteadyStreamOfSampledOutEvents()
+    {
+        var sink = new InMemorySink();
+        var pipeline = BuildPipeline(
+            [sink],
+            [new KeepFirstThenDropSampler()],
+            new PipelineOptions { BatchSize = 10, BatchFlushInterval = TimeSpan.FromMilliseconds(150) });
+
+        await pipeline.StartAsync(CancellationToken.None);
+
+        // One kept event sits in a partial batch...
+        await pipeline.EmitAsync(new WideEvent());
+
+        // ...while sampled-out traffic keeps arriving. Dropped events must not postpone the
+        // deadline of the event already waiting.
+        for (int i = 0; i < 15; i++)
+        {
+            await pipeline.EmitAsync(new WideEvent());
+            await Task.Delay(40, TestContext.Current.CancellationToken);
+        }
+
+        Assert.Single(sink.Events);
+
+        await pipeline.StopAsync(CancellationToken.None);
+    }
+
+    private sealed class KeepFirstThenDropSampler : ISamplingStrategy
+    {
+        private int _seen;
+        public SamplingDecision Evaluate(WideEvent ev)
+            => Interlocked.Increment(ref _seen) == 1 ? SamplingDecision.Keep : SamplingDecision.Drop;
+    }
+
     private sealed class ThrowOnceSerializer : IWideEventSerializer
     {
         private int _calls;

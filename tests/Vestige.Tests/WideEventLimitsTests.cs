@@ -1,3 +1,4 @@
+using System.Text;
 using Vestige;
 using Vestige.Internal;
 
@@ -93,6 +94,35 @@ public sealed class WideEventLimitsTests
         var stack = ev.Get<string>("error.stack_trace")!;
         Assert.True(stack.Length <= 32 + WideEventLimits.TruncationSuffix.Length);
         Assert.Equal("boom", ev.Get<string>("error.message"));
+    }
+
+    [Fact]
+    public void Truncation_DoesNotSplitSurrogatePairs()
+    {
+        var emoji = string.Concat(Enumerable.Repeat("\U0001F600", 20));
+
+        // An odd cut lands mid-pair; the orphaned half would serialize as U+FFFD.
+        var ev = new WideEvent(new WideEventLimits { MaxValueLength = 5 });
+        ev.Set("k", emoji);
+
+        var value = ev.Get<string>("k")!;
+        var body = value[..^WideEventLimits.TruncationSuffix.Length];
+
+        Assert.False(char.IsHighSurrogate(body[^1]), "truncation left an orphaned high surrogate");
+
+        // A lone surrogate does not survive a UTF-8 round trip; it becomes U+FFFD.
+        Assert.Equal(body, Encoding.UTF8.GetString(Encoding.UTF8.GetBytes(body)));
+    }
+
+    [Fact]
+    public void TruncatedSurrogateValue_SerializesWithoutCorruption()
+    {
+        var ev = new WideEvent(new WideEventLimits { MaxValueLength = 5 });
+        ev.Set("k", string.Concat(Enumerable.Repeat("\U0001F600", 20)));
+
+        var json = Encoding.UTF8.GetString(new SystemTextJsonSerializer().Serialize(ev).JsonBytes);
+
+        Assert.DoesNotContain("\uFFFD", json, StringComparison.Ordinal);
     }
 
     [Theory]
