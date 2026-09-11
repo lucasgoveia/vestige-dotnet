@@ -232,7 +232,8 @@ builder.Services
         sampling.AlwaysKeepErrors();
         sampling.AlwaysKeepSlowRequests(thresholdMs: 2000);
         sampling.AlwaysKeepWhen(e => e.Get<string>("user.subscription") == "enterprise");
-        sampling.RateForPath("/healthz", 0.001);
+        sampling.RateForPath(0.001, "/healthz", "/readyz");
+        sampling.AlwaysKeepPaths("/checkout/*");
         sampling.DefaultRate(0.05);
     });
 ```
@@ -280,6 +281,40 @@ var app = builder.Build();
 app.UseVestige();
 ```
 
+## Backpressure and Event Size
+
+Emitting is non-blocking by default: events go onto a bounded channel and a background consumer
+serializes and dispatches them. If sinks cannot keep up, the buffer fills and events are dropped
+rather than slowing down requests.
+
+Dropping silently would be the worst outcome for an observability library, so losses are counted
+and logged. Resolve `IWideEventPipeline` and alert on the counter:
+
+```csharp
+var dropped = app.Services.GetRequiredService<IWideEventPipeline>().DroppedEventCount;
+```
+
+Pick the trade-off explicitly with `OnBufferFull`:
+
+| Value | Behavior |
+|---|---|
+| `Drop` (default) | Discard the new event. Requests never block. Counted. |
+| `DropOldest` | Evict the oldest buffered event. Counted. |
+| `Block` | Apply backpressure to the request until space frees up. Never loses an event. |
+
+Individual events are bounded too, so one pathological request cannot produce a multi-megabyte
+event. Fields past the cap are discarded and reported as `vestige.dropped_fields` on the event:
+
+```csharp
+builder.Services.AddVestige(options =>
+{
+    options.ServiceName = "checkout-service";
+    options.Limits.MaxFieldCount = 256;      // fields per event
+    options.Limits.MaxValueLength = 4096;    // characters per string value
+    options.Limits.MaxStackTraceLength = 8192;
+});
+```
+
 ## Background Jobs
 
 For non-HTTP contexts, use `IWideEventScopeFactory`:
@@ -295,7 +330,7 @@ public class OrderProcessor : BackgroundService
     {
         await foreach (var msg in _queue.ReadAllAsync(ct))
         {
-            await using var scope = _vestige.BeginScope("job.process_order");
+            await using var scope = await _vestige.BeginScopeAsync("job.process_order", ct);
             var ev = scope.Event;
 
             ev.Set("job.type", "process_order");
@@ -304,14 +339,13 @@ public class OrderProcessor : BackgroundService
             try
             {
                 await ProcessAsync(msg, ct);
-                ev.Outcome = "success";
             }
             catch (Exception ex)
             {
-                ev.Outcome = "error";
-                ev.CaptureException(ex);
+                ev.CaptureException(ex); // also sets outcome to "error"
             }
-            // Event auto-emitted on dispose
+            // Outcome defaults to "success", duration_ms is measured by the scope,
+            // and the event is auto-emitted on dispose.
         }
     }
 }

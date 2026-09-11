@@ -13,7 +13,7 @@ public sealed class WideEventMiddleware
     private readonly RequestDelegate _next;
     private readonly IWideEventFactory _factory;
     private readonly IWideEventPipeline _pipeline;
-    private readonly IReadOnlyList<IWideEventEnricher> _enrichers;
+    private readonly IWideEventEnricher[] _enrichers;
 
     public WideEventMiddleware(
         RequestDelegate next,
@@ -24,7 +24,7 @@ public sealed class WideEventMiddleware
         _next = next;
         _factory = factory;
         _pipeline = pipeline;
-        _enrichers = enrichers.ToList();
+        _enrichers = enrichers.ToArray();
     }
 
     public async Task InvokeAsync(HttpContext context, IWideEventAccessorSetter accessor)
@@ -32,7 +32,7 @@ public sealed class WideEventMiddleware
         var ev = _factory.Create();
         accessor.Set(ev);
 
-        var sw = Stopwatch.StartNew();
+        var startedAt = Stopwatch.GetTimestamp();
 
         try
         {
@@ -44,15 +44,28 @@ public sealed class WideEventMiddleware
 
             await _next(context).ConfigureAwait(false);
         }
+        catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+        {
+            // A client disconnect is not a server fault; record it as its own outcome.
+            ev.TrySetOutcome("cancelled");
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // This middleware sits below the exception handler, so the response status is still
+            // 200 at this point. Without capturing here the event would be emitted as a success
+            // and tail sampling would treat it as ordinary traffic.
+            ev.CaptureException(ex);
+            throw;
+        }
         finally
         {
-            sw.Stop();
-            ev.DurationMs = sw.Elapsed.TotalMilliseconds;
+            ev.DurationMs = Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds;
 
             if (context.Response.StatusCode > 0)
                 ev.StatusCode = context.Response.StatusCode;
 
-            ev.Outcome ??= context.Response.StatusCode >= 500 ? "error" : "success";
+            ev.TrySetOutcome(context.Response.StatusCode >= 500 ? "error" : "success");
 
             foreach (var enricher in _enrichers)
             {

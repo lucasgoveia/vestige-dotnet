@@ -99,7 +99,15 @@ internal sealed class PostgresEventRow
 
     private static DateTimeOffset GetRequiredTimestamp(IReadOnlyDictionary<string, object?> fields, string key)
     {
-        var raw = GetRequiredString(fields, key);
-        return DateTimeOffset.Parse(raw, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
+        if (!fields.TryGetValue(key, out var value) || value is null)
+            throw new InvalidOperationException($"Field '{key}' is required.");
+
+        return value switch
+        {
+            DateTimeOffset timestamp => timestamp,
+            DateTime timestamp => new DateTimeOffset(timestamp.ToUniversalTime(), TimeSpan.Zero),
+            string raw => DateTimeOffset.Parse(raw, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+            _ => throw new InvalidOperationException($"Field '{key}' must be a timestamp."),
+        };
     }
 }

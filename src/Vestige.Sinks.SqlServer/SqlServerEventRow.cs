@@ -47,21 +47,29 @@ internal sealed class SqlServerEventRow
         {
             EventId = eventId,
             TimestampUtc = GetRequiredTimestamp(data.Fields, "timestamp"),
-            ServiceName = GetOptionalString(data.Fields, "service.name"),
-            ServiceVersion = GetOptionalString(data.Fields, "service.version"),
-            DeploymentEnvironment = GetOptionalString(data.Fields, "deployment.environment"),
-            CloudRegion = GetOptionalString(data.Fields, "cloud.region"),
-            TraceId = GetOptionalString(data.Fields, "trace_id"),
-            SpanId = GetOptionalString(data.Fields, "span_id"),
-            Outcome = GetOptionalString(data.Fields, "outcome"),
+            ServiceName = Truncate(GetOptionalString(data.Fields, "service.name"), 256),
+            ServiceVersion = Truncate(GetOptionalString(data.Fields, "service.version"), 64),
+            DeploymentEnvironment = Truncate(GetOptionalString(data.Fields, "deployment.environment"), 128),
+            CloudRegion = Truncate(GetOptionalString(data.Fields, "cloud.region"), 128),
+            TraceId = Truncate(GetOptionalString(data.Fields, "trace_id"), 64),
+            SpanId = Truncate(GetOptionalString(data.Fields, "span_id"), 32),
+            Outcome = Truncate(GetOptionalString(data.Fields, "outcome"), 32),
             DurationMs = GetRequiredDouble(data.Fields, "duration_ms"),
             HttpStatusCode = GetOptionalInt(data.Fields, "http.status_code"),
-            HttpMethod = GetOptionalString(data.Fields, "http.method"),
-            HttpPath = GetOptionalString(data.Fields, "http.path"),
-            ErrorType = GetOptionalString(data.Fields, "error.type"),
+            HttpMethod = Truncate(GetOptionalString(data.Fields, "http.method"), 16),
+            HttpPath = Truncate(GetOptionalString(data.Fields, "http.path"), 2048),
+            ErrorType = Truncate(GetOptionalString(data.Fields, "error.type"), 512),
             PayloadJson = Encoding.UTF8.GetString(data.JsonBytes),
         };
     }
+
+    /// <summary>
+    /// Clamp a value to its column width. The full value always survives in the JSON payload, so
+    /// truncating here loses nothing — whereas overflowing the column fails the entire batch with
+    /// "String or binary data would be truncated".
+    /// </summary>
+    private static string? Truncate(string? value, int maxLength)
+        => value is null || value.Length <= maxLength ? value : value[..maxLength];
 
     private static string GetRequiredString(IReadOnlyDictionary<string, object?> fields, string key)
         => GetOptionalString(fields, key)
@@ -100,7 +108,15 @@ internal sealed class SqlServerEventRow
 
     private static DateTimeOffset GetRequiredTimestamp(IReadOnlyDictionary<string, object?> fields, string key)
     {
-        var raw = GetRequiredString(fields, key);
-        return DateTimeOffset.Parse(raw, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
+        if (!fields.TryGetValue(key, out var value) || value is null)
+            throw new InvalidOperationException($"Field '{key}' is required.");
+
+        return value switch
+        {
+            DateTimeOffset timestamp => timestamp,
+            DateTime timestamp => new DateTimeOffset(timestamp.ToUniversalTime(), TimeSpan.Zero),
+            string raw => DateTimeOffset.Parse(raw, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+            _ => throw new InvalidOperationException($"Field '{key}' must be a timestamp."),
+        };
     }
 }

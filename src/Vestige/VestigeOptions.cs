@@ -17,4 +17,10 @@ public sealed class VestigeOptions
 
     /// <summary>Runtime environment name (e.g. "production", "staging").</summary>
     public string? Environment { get; set; }
+
+    /// <summary>
+    /// Caps applied to every event as fields are added, so one pathological request cannot
+    /// produce a multi-megabyte event. See <see cref="WideEventLimits"/> for the defaults.
+    /// </summary>
+    public WideEventLimits Limits { get; set; } = new();
 }
