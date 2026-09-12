@@ -1,9 +1,15 @@
 namespace Vestige.Internal;
 
 /// <summary>Chains a list of <see cref="ISamplingStrategy"/> instances. All-Defer defaults to Keep.</summary>
-internal sealed class TailSampler(IEnumerable<ISamplingStrategy> strategies)
+internal sealed class TailSampler
 {
-    private readonly IReadOnlyList<ISamplingStrategy> _strategies = strategies.ToList();
+    private readonly ISamplingStrategy[] _strategies;
+
+    public TailSampler(IEnumerable<ISamplingStrategy> strategies)
+    {
+        ArgumentNullException.ThrowIfNull(strategies);
+        _strategies = strategies.ToArray();
+    }
 
     public SamplingDecision Evaluate(WideEvent ev)
     {

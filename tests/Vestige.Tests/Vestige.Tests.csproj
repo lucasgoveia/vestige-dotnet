@@ -29,6 +29,13 @@
     <ProjectReference Include="..\..\src\Vestige.Testing\Vestige.Testing.csproj" />
     <ProjectReference Include="..\..\src\Vestige.Sinks.Console\Vestige.Sinks.Console.csproj" />
     <ProjectReference Include="..\..\src\Vestige.Sinks.Postgres\Vestige.Sinks.Postgres.csproj" />
+    <ProjectReference Include="..\..\src\Vestige.Sinks.SqlServer\Vestige.Sinks.SqlServer.csproj" />
+    <ProjectReference Include="..\..\src\Vestige.Extensions.AspNetCore\Vestige.Extensions.AspNetCore.csproj" />
+  </ItemGroup>
+
+  <!-- HttpContext, for the middleware tests -->
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>
 
   <ItemGroup>

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Threading.Channels;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -14,11 +15,14 @@ internal sealed class WideEventPipeline : IWideEventPipeline, IHostedService, IA
     private readonly Channel<WideEvent> _channel;
     private readonly IWideEventSerializer _serializer;
     private readonly TailSampler _sampler;
-    private readonly IReadOnlyList<IWideEventSink> _sinks;
+    private readonly IWideEventSink[] _sinks;
     private readonly PipelineOptions _options;
     private readonly ILogger<WideEventPipeline> _logger;
+    private readonly bool _blockWhenFull;
+
     private Task _consumerTask = Task.CompletedTask;
-    private CancellationTokenSource _cts = new();
+    private CancellationTokenSource? _cts;
+    private long _droppedEvents;
 
     public WideEventPipeline(
         IWideEventSerializer serializer,
@@ -29,9 +33,12 @@ internal sealed class WideEventPipeline : IWideEventPipeline, IHostedService, IA
     {
         _serializer = serializer;
         _sampler = new TailSampler(strategies);
-        _sinks = sinks.ToList();
+        _sinks = sinks.ToArray();
         _options = options.Value;
         _logger = logger;
+
+        _options.Validate();
+        _blockWhenFull = _options.OnBufferFull == BufferFullBehavior.Block;
 
         var channelOptions = new BoundedChannelOptions(_options.BufferCapacity)
         {
@@ -44,19 +51,42 @@ internal sealed class WideEventPipeline : IWideEventPipeline, IHostedService, IA
             SingleReader = true,
             SingleWriter = false,
         };
-        _channel = Channel.CreateBounded<WideEvent>(channelOptions);
+        // The itemDropped callback is the only reliable drop signal: under DropWrite and DropOldest
+        // the channel discards the item and still reports success from TryWrite.
+        _channel = Channel.CreateBounded<WideEvent>(channelOptions, _ => RecordDrop());
     }
 
     /// <inheritdoc/>
-    public async ValueTask EmitAsync(WideEvent ev, CancellationToken cancellationToken = default)
+    public long DroppedEventCount => Interlocked.Read(ref _droppedEvents);
+
+    /// <inheritdoc/>
+    public ValueTask EmitAsync(WideEvent ev, CancellationToken cancellationToken = default)
     {
-        if (_options.OnBufferFull == BufferFullBehavior.Block)
+        ArgumentNullException.ThrowIfNull(ev);
+
+        // Deliberately not `async`: the non-blocking path is fully synchronous and runs once per
+        // request, so it must not pay for an async state machine.
+        if (_blockWhenFull)
+            return _channel.Writer.WriteAsync(ev, cancellationToken);
+
+        // Drops are reported through the channel's itemDropped callback, not this return value:
+        // in the dropping modes TryWrite reports success even when the item is discarded.
+        _channel.Writer.TryWrite(ev);
+        return ValueTask.CompletedTask;
+    }
+
+    private void RecordDrop()
+    {
+        var dropped = Interlocked.Increment(ref _droppedEvents);
+
+        // Loud on the first loss, then rate-limited so an overloaded pipeline cannot
+        // amplify itself through the logger.
+        if (dropped == 1 || dropped % 1000 == 0)
         {
-            await _channel.Writer.WriteAsync(ev, cancellationToken).ConfigureAwait(false);
-        }
-        else
-        {
-            _channel.Writer.TryWrite(ev);
+            _logger.LogWarning(
+                "Wide event buffer full; dropped {DroppedCount} event(s) so far. " +
+                "Raise PipelineOptions.BufferCapacity or reduce sink latency.",
+                dropped);
         }
     }
 
@@ -75,6 +105,7 @@ internal sealed class WideEventPipeline : IWideEventPipeline, IHostedService, IA
             }
         }
 
+        _cts?.Dispose();
         _cts = new CancellationTokenSource();
         _consumerTask = ConsumeAsync(_cts.Token);
     }
@@ -84,6 +115,7 @@ internal sealed class WideEventPipeline : IWideEventPipeline, IHostedService, IA
     {
         _channel.Writer.Complete();
 
+        var gracefulDrain = true;
         try
         {
             // Drain buffered events while the host shutdown deadline still allows it.
@@ -91,7 +123,10 @@ internal sealed class WideEventPipeline : IWideEventPipeline, IHostedService, IA
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            await _cts.CancelAsync().ConfigureAwait(false);
+            gracefulDrain = false;
+
+            if (_cts is not null)
+                await _cts.CancelAsync().ConfigureAwait(false);
 
             try
             {
@@ -103,119 +138,132 @@ internal sealed class WideEventPipeline : IWideEventPipeline, IHostedService, IA
             }
         }
 
+        // On the forced path the caller's token is already cancelled. Flushing with it would fail
+        // every sink at exactly the moment the flush matters most, so fall back to a bounded budget.
+        using var flushCts = gracefulDrain
+            ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+            : new CancellationTokenSource();
+
+        if (!gracefulDrain && _options.ShutdownFlushTimeout > TimeSpan.Zero)
+            flushCts.CancelAfter(_options.ShutdownFlushTimeout);
+
         foreach (var sink in _sinks)
         {
             try
             {
-                await sink.FlushAsync(cancellationToken).ConfigureAwait(false);
+                await sink.FlushAsync(flushCts.Token).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Sink {Sink} failed to flush on shutdown.", sink.GetType().Name);
             }
         }
+
+        if (DroppedEventCount > 0)
+            _logger.LogWarning("Vestige dropped {DroppedCount} event(s) due to a full buffer.", DroppedEventCount);
     }
 
     private async Task ConsumeAsync(CancellationToken cancellationToken)
     {
+        var reader = _channel.Reader;
         var batch = new List<WideEventData>(_options.BatchSize);
-        DateTimeOffset? batchStartedAt = null;
+        var batchStartedAt = 0L;
 
-        while (await _channel.Reader.WaitToReadAsync(CancellationToken.None).ConfigureAwait(false))
+        while (true)
         {
-            while (_channel.Reader.TryRead(out var ev))
+            if (batch.Count == 0)
             {
-                ProcessEvent(ev, batch, ref batchStartedAt, cancellationToken);
-
-                if (batch.Count >= _options.BatchSize)
-                    await FlushBatchAsync(batch).ConfigureAwait(false);
+                // Never pass the shutdown token here: a cancelled wait would abandon events that
+                // are already sitting in the channel.
+                if (!await reader.WaitToReadAsync(CancellationToken.None).ConfigureAwait(false))
+                    break;
             }
 
-            while (batch.Count > 0 && batch.Count < _options.BatchSize)
+            while (batch.Count < _options.BatchSize && reader.TryRead(out var ev))
             {
-                var startedAt = batchStartedAt ?? DateTimeOffset.UtcNow;
-                var remaining = _options.BatchFlushInterval - (DateTimeOffset.UtcNow - startedAt);
-                if (remaining <= TimeSpan.Zero)
-                {
-                    await FlushBatchAsync(batch).ConfigureAwait(false);
-                    break;
-                }
+                // Stamp the deadline only on the empty-to-first transition. Testing `Count == 1`
+                // after every read would restamp it for each sampled-out event arriving behind a
+                // batch already holding exactly one, postponing that event's flush indefinitely.
+                var wasEmpty = batch.Count == 0;
+                ProcessEvent(ev, batch);
+                if (wasEmpty && batch.Count == 1)
+                    batchStartedAt = Stopwatch.GetTimestamp();
+            }
 
-                try
-                {
-                    var waitToReadTask = _channel.Reader.WaitToReadAsync(CancellationToken.None).AsTask();
-                    var delayTask = Task.Delay(remaining, cancellationToken);
-                    var completedTask = await Task.WhenAny(waitToReadTask, delayTask).ConfigureAwait(false);
+            if (batch.Count == 0)
+                continue;
 
-                    if (completedTask == delayTask)
-                    {
-                        await FlushBatchAsync(batch).ConfigureAwait(false);
-                        break;
-                    }
+            if (batch.Count >= _options.BatchSize)
+            {
+                await FlushBatchAsync(batch, cancellationToken).ConfigureAwait(false);
+                continue;
+            }
 
-                    if (!await waitToReadTask.ConfigureAwait(false))
-                        break;
-
-                    while (batch.Count < _options.BatchSize && _channel.Reader.TryRead(out var ev))
-                    {
-                        ProcessEvent(ev, batch, ref batchStartedAt, cancellationToken);
-
-                        if (batch.Count >= _options.BatchSize)
-                        {
-                            await FlushBatchAsync(batch).ConfigureAwait(false);
-                            break;
-                        }
-                    }
-                }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-                {
-                    await FlushBatchAsync(batch).ConfigureAwait(false);
-                    break;
-                }
+            var remaining = _options.BatchFlushInterval - Stopwatch.GetElapsedTime(batchStartedAt);
+            if (remaining <= TimeSpan.Zero ||
+                !await WaitForMoreAsync(remaining, cancellationToken).ConfigureAwait(false))
+            {
+                await FlushBatchAsync(batch, cancellationToken).ConfigureAwait(false);
             }
         }
 
         if (batch.Count > 0)
-            await FlushBatchAsync(batch).ConfigureAwait(false);
+            await FlushBatchAsync(batch, cancellationToken).ConfigureAwait(false);
 
-        return;
-
-        void ProcessEvent(
-            WideEvent ev,
-            List<WideEventData> targetBatch,
-            ref DateTimeOffset? startedAt,
-            CancellationToken processingCancellationToken)
+        void ProcessEvent(WideEvent ev, List<WideEventData> targetBatch)
         {
             try
             {
                 if (_sampler.Evaluate(ev) == SamplingDecision.Drop)
                     return;
 
-                var data = _serializer.Serialize(ev);
-                targetBatch.Add(data);
-                startedAt ??= DateTimeOffset.UtcNow;
+                targetBatch.Add(_serializer.Serialize(ev));
             }
-            catch (Exception ex) when (!processingCancellationToken.IsCancellationRequested)
+            catch (Exception ex)
             {
+                // Unconditional: a throw here during shutdown would fault the consumer and abandon
+                // every event still buffered behind this one.
                 _logger.LogError(ex, "Error processing wide event.");
             }
         }
+    }
 
-        async Task FlushBatchAsync(List<WideEventData> targetBatch)
+    /// <summary>
+    /// Wait for more events, giving up after <paramref name="timeout"/>. Returns false when the
+    /// batch window expired, the channel completed, or shutdown was requested.
+    /// </summary>
+    private async ValueTask<bool> WaitForMoreAsync(TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        // The CTS is disposed on every path, so neither the timer nor the cancellation
+        // registration outlives the wait.
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutCts.CancelAfter(timeout);
+
+        try
         {
-            await DispatchBatchAsync(targetBatch, cancellationToken).ConfigureAwait(false);
-            targetBatch.Clear();
-            batchStartedAt = null;
+            return await _channel.Reader.WaitToReadAsync(timeoutCts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
         }
     }
 
-    private async Task DispatchBatchAsync(List<WideEventData> batch, CancellationToken cancellationToken)
+    private async Task FlushBatchAsync(List<WideEventData> batch, CancellationToken cancellationToken)
     {
+        if (batch.Count == 0)
+            return;
+
+        // Hand sinks their own array: `batch` is cleared and refilled immediately, so a sink that
+        // held the reference across an await would observe it mutate underneath.
+        var payload = batch.ToArray();
+        batch.Clear();
+
         foreach (var sink in _sinks)
         {
             try
             {
-                await sink.EmitBatchAsync(batch, cancellationToken).ConfigureAwait(false);
+                await sink.EmitBatchAsync(payload, cancellationToken).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -231,6 +279,6 @@ internal sealed class WideEventPipeline : IWideEventPipeline, IHostedService, IA
             try { await sink.DisposeAsync().ConfigureAwait(false); }
             catch { /* best-effort */ }
         }
-        _cts.Dispose();
+        _cts?.Dispose();
     }
 }

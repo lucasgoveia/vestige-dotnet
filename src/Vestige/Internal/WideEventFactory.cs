@@ -3,14 +3,22 @@ using Microsoft.Extensions.Options;
 namespace Vestige.Internal;
 
 /// <summary>Creates <see cref="WideEvent"/> instances from configured options.</summary>
-internal sealed class WideEventFactory(IOptions<VestigeOptions> options) : IWideEventFactory
+internal sealed class WideEventFactory : IWideEventFactory
 {
-    private readonly VestigeOptions _options = options.Value;
+    private readonly VestigeOptions _options;
+    private readonly WideEventLimits _limits;
+
+    public WideEventFactory(IOptions<VestigeOptions> options)
+    {
+        _options = options.Value;
+        _limits = _options.Limits ?? WideEventLimits.Default;
+        _limits.Validate();
+    }
 
     /// <inheritdoc/>
     public WideEvent Create()
     {
-        var ev = new WideEvent
+        var ev = new WideEvent(_limits)
         {
             ServiceName = _options.ServiceName,
         };
