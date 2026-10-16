@@ -42,20 +42,60 @@ internal sealed class SqlServerWriter : ISqlServerWriter
         }
 
         var diff = await ReadDiffAsync(connection, layout, cancellationToken).ConfigureAwait(false);
-        try
-        {
-            foreach (var field in diff.MissingColumns)
-                await ExecuteAsync(connection, SqlServerSchemaSql.AddColumn(layout, field), cancellationToken).ConfigureAwait(false);
-        }
-        catch (SqlException ex) when (ex.Number == 2705)
-        {
-            // Another replica added the column first; re-read and add whatever is still missing.
-            diff = await ReadDiffAsync(connection, layout, cancellationToken).ConfigureAwait(false);
-            foreach (var field in diff.MissingColumns)
-                await ExecuteAsync(connection, SqlServerSchemaSql.AddColumn(layout, field), cancellationToken).ConfigureAwait(false);
-        }
+        if (diff.MissingColumns.Count > 0)
+            diff = await AddMissingColumnsAsync(connection, layout, diff, cancellationToken).ConfigureAwait(false);
 
         return diff.MissingIndexes;
+    }
+
+    private const int AddColumnsAttempts = 3;
+    private static readonly TimeSpan AddColumnsRetryPause = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// The ALTER is metadata-only but needs a schema-modification lock; while it waits, every insert queues
+    /// behind it. Each attempt waits at most <see cref="SqlServerSchemaSql.AddColumnsLockTimeoutMs"/>, with
+    /// pauses between attempts that let queued writes drain.
+    /// </summary>
+    private static async Task<SchemaDiff> AddMissingColumnsAsync(
+        SqlConnection connection,
+        SqlServerTableLayout layout,
+        SchemaDiff diff,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            for (var attempt = 1; ; attempt++)
+            {
+                try
+                {
+                    await ExecuteAsync(connection, SqlServerSchemaSql.AddColumns(layout, diff.MissingColumns), cancellationToken).ConfigureAwait(false);
+                    return diff;
+                }
+                catch (SqlException ex) when (ex.Number is 1222 or 2705 && attempt < AddColumnsAttempts)
+                {
+                    // 1222: lock wait timed out. 2705: another replica added a column first.
+                    await Task.Delay(AddColumnsRetryPause, cancellationToken).ConfigureAwait(false);
+                }
+                catch (SqlException ex) when (ex.Number == 1222)
+                {
+                    throw new InvalidOperationException(
+                        $"Could not add promoted column(s) to {layout.QualifiedTable}: waited {AddColumnsAttempts} times for a schema lock " +
+                        $"({SqlServerSchemaSql.AddColumnsLockTimeoutMs} ms each) while another session held a lock on the table. " +
+                        "Restart once the blocking session has finished.",
+                        ex);
+                }
+
+                diff = await ReadDiffAsync(connection, layout, cancellationToken).ConfigureAwait(false);
+                if (diff.MissingColumns.Count == 0)
+                    return diff;
+            }
+        }
+        finally
+        {
+            // SET LOCK_TIMEOUT is session-scoped; never leave it on the connection inserts use.
+            if (connection.State == ConnectionState.Open)
+                await ExecuteAsync(connection, "SET LOCK_TIMEOUT -1;", CancellationToken.None).ConfigureAwait(false);
+        }
     }
 
     public async Task VerifyStorageAsync(CancellationToken cancellationToken)

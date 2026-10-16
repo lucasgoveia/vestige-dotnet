@@ -61,6 +61,34 @@ public sealed class SqlServerSchemaSqlTests
     }
 
     [Fact]
+    public void AddColumns_OneAlterWithBoundedLockWait()
+    {
+        var layout = Layout(o =>
+        {
+            o.PromotedFields.Add("audit_action", PromotedType.String(128));
+            o.PromotedFields.Add("tenant_id", PromotedType.Guid);
+        });
+
+        Assert.Equal(
+            "SET LOCK_TIMEOUT 5000; ALTER TABLE [dbo].[wide_events] ADD [audit_action] NVARCHAR(128) NULL, [tenant_id] UNIQUEIDENTIFIER NULL;",
+            SqlServerSchemaSql.AddColumns(layout, layout.Promoted));
+    }
+
+    [Fact]
+    public void CreateIndexOnline_LowPriority_WaitsWithoutBlockingWriters()
+    {
+        var layout = Layout(o => o.PromotedFields.Add("audit_action", PromotedType.String(128)));
+
+        Assert.Equal(
+            "CREATE INDEX [dbo_wide_events_audit_action_idx] ON [dbo].[wide_events] ([audit_action], [timestamp_utc] DESC) " +
+            "WITH (ONLINE = ON (WAIT_AT_LOW_PRIORITY (MAX_DURATION = 1 MINUTES, ABORT_AFTER_WAIT = SELF)));",
+            SqlServerSchemaSql.CreateIndexOnline(layout, layout.Promoted[0], lowPriority: true));
+        Assert.Equal(
+            "SET LOCK_TIMEOUT 10000; CREATE INDEX [dbo_wide_events_audit_action_idx] ON [dbo].[wide_events] ([audit_action], [timestamp_utc] DESC) WITH (ONLINE = ON);",
+            SqlServerSchemaSql.CreateIndexOnline(layout, layout.Promoted[0], lowPriority: false));
+    }
+
+    [Fact]
     public void AddColumn_IsNullable()
     {
         var layout = Layout(o => o.PromotedFields.Add("tenant_id", PromotedType.Guid));

@@ -187,6 +187,81 @@ public sealed class SqlServerSinkTests
             () => sink.RunRetentionCycleAsync(TestContext.Current.CancellationToken));
     }
 
+    [Fact]
+    public async Task Initialize_TransientStorageFailure_LaterEmitStillWrites()
+    {
+        var writer = new FakeSqlServerWriter { EnsureFailure = new TimeoutException("database resuming") };
+        await using var sink = CreateSink(writer);
+
+        await Assert.ThrowsAsync<TimeoutException>(() => sink.InitializeAsync(TestContext.Current.CancellationToken));
+        await sink.EmitAsync(MakeData(), TestContext.Current.CancellationToken);
+
+        Assert.Single(writer.Inserts);
+    }
+
+    [Fact]
+    public async Task Initialize_SchemaError_EmitFailsWithOriginalCause()
+    {
+        var writer = new FakeSqlServerWriter
+        {
+            EnsureFailure = new InvalidOperationException("Promoted column [tenant_id] exists but is NOT NULL."),
+        };
+        await using var sink = CreateSink(writer);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => sink.InitializeAsync(TestContext.Current.CancellationToken));
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => sink.EmitAsync(MakeData(), TestContext.Current.CancellationToken));
+
+        Assert.Contains("NOT NULL", ex.Message);
+        Assert.Empty(writer.Inserts);
+    }
+
+    [Fact]
+    public async Task Dispose_BackgroundWorkFaultingWithNonCancellationException_IsNotLoggedAsError()
+    {
+        var writer = new FakeSqlServerWriter();
+        var options = new SqlServerSinkOptions { ConnectionString = "Server=.;Database=x" };
+        options.PromotedFields.Add("audit_action", PromotedType.String(128));
+        writer.PendingIndexes = [options.PromotedFields[0]];
+        var logger = new ListLogger<SqlServerSink>();
+        var sink = new SqlServerSink(
+            Options.Create(options), logger, writer, TimeProvider.System,
+            buildIndexes: async (_, _, ct) =>
+            {
+                try
+                {
+                    await Task.Delay(Timeout.Infinite, ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    // Microsoft.Data.SqlClient surfaces a cancelled command as a SqlException, not an OCE.
+                    throw new InvalidOperationException("Operation cancelled by user.");
+                }
+            });
+        await sink.InitializeAsync(TestContext.Current.CancellationToken);
+
+        await sink.DisposeAsync();
+
+        Assert.DoesNotContain(logger.Entries, e => e.Level >= Microsoft.Extensions.Logging.LogLevel.Error);
+    }
+
+    [Fact]
+    public async Task Dispose_BackgroundWorkIgnoringCancellation_CompletesWithinBound()
+    {
+        var writer = new FakeSqlServerWriter();
+        var options = new SqlServerSinkOptions { ConnectionString = "Server=.;Database=x" };
+        options.PromotedFields.Add("audit_action", PromotedType.String(128));
+        writer.PendingIndexes = [options.PromotedFields[0]];
+        var sink = new SqlServerSink(
+            Options.Create(options), new ListLogger<SqlServerSink>(), writer, TimeProvider.System,
+            buildIndexes: (_, _, _) => Task.Delay(Timeout.Infinite, CancellationToken.None));
+        await sink.InitializeAsync(TestContext.Current.CancellationToken);
+
+        await sink.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(20), TestContext.Current.CancellationToken);
+
+        Assert.True(writer.Disposed);
+    }
+
     private sealed class RecordingRetentionStore : IRetentionStore
     {
         public List<RetentionPass> Passes { get; } = [];

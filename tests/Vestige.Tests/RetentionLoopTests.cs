@@ -139,6 +139,25 @@ public sealed class RetentionLoopTests
         Assert.DoesNotContain(logger.Entries, e => e.Level >= LogLevel.Warning);
     }
 
+    [Fact]
+    public async Task RunAsync_CancelledMidCycle_DriverFaultsWithNonCancellationException_CompletesQuietly()
+    {
+        var time = new FakeTimeProvider();
+        var store = new FakeStore { BlockDeletes = true, CancelAs = new InvalidOperationException("Operation cancelled by user.") };
+        var logger = new ListLogger<RetentionLoop>();
+        var loop = new RetentionLoop([Short], store, logger, time);
+        using var cts = new CancellationTokenSource();
+
+        var run = loop.RunAsync(cts.Token);
+        Assert.True(await AdvanceUntilAsync(time, RetentionLoop.InitialDelay, store.LockAttempts));
+        Assert.True(await store.DeleteStarted.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+        cts.Cancel();
+        await run;
+
+        Assert.True(run.IsCompletedSuccessfully);
+        Assert.DoesNotContain(logger.Entries, e => e.Level >= LogLevel.Warning);
+    }
+
     // FakeTimeProvider only fires timers that already exist, and the loop registers its next
     // delay asynchronously, so keep advancing until the expected cycle is observed. Overshooting
     // can trigger extra cycles, which these tests tolerate.
@@ -160,6 +179,7 @@ public sealed class RetentionLoopTests
         public Exception? LockFailure { get; init; }
         public Exception? DeleteFailure { get; init; }
         public bool BlockDeletes { get; init; }
+        public Exception? CancelAs { get; init; }
         public Dictionary<RetentionPass, Queue<int>> Results { get; } = [];
         public List<RetentionPass> Calls { get; } = [];
         public List<int> BatchSizes { get; } = [];
@@ -183,7 +203,16 @@ public sealed class RetentionLoopTests
             if (DeleteFailure is not null)
                 throw DeleteFailure;
             if (BlockDeletes)
-                await Task.Delay(Timeout.Infinite, cancellationToken);
+            {
+                try
+                {
+                    await Task.Delay(Timeout.Infinite, cancellationToken);
+                }
+                catch (OperationCanceledException) when (CancelAs is not null)
+                {
+                    throw CancelAs;
+                }
+            }
             return Results.TryGetValue(pass, out var queue) && queue.Count > 0 ? queue.Dequeue() : 0;
         }
 

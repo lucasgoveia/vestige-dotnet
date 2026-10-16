@@ -10,6 +10,7 @@ internal sealed class FakeSqlServerWriter : ISqlServerWriter
 
     public SqlServerTableLayout? Layout { get; private set; }
     public IReadOnlyList<PromotedField> PendingIndexes { get; set; } = [];
+    public Exception? EnsureFailure { get; set; }
     public int EnsureCalls { get; private set; }
     public int VerifyCalls { get; private set; }
     public bool Disposed { get; private set; }
@@ -25,6 +26,8 @@ internal sealed class FakeSqlServerWriter : ISqlServerWriter
     public Task<IReadOnlyList<PromotedField>> EnsureStorageAsync(CancellationToken cancellationToken)
     {
         EnsureCalls++;
+        if (EnsureFailure is not null)
+            return Task.FromException<IReadOnlyList<PromotedField>>(EnsureFailure);
         return Task.FromResult(PendingIndexes);
     }
 

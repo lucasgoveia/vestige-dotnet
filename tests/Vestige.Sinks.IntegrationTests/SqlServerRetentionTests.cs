@@ -65,4 +65,25 @@ public sealed class SqlServerRetentionTests(SqlServerFixture db)
         Assert.False(result.Acquired);
         Assert.Equal(4, await SqlTestDb.ScalarAsync<int>(db.ConnectionString, $"SELECT COUNT(*) FROM dbo.[{table}]"));
     }
+
+    [Fact]
+    public async Task Cycle_KeepsPreUpgradeAuditRowsWhosePromotedColumnIsNull()
+    {
+        db.SkipIfUnavailable();
+        var table = SqlTestDb.UniqueTable();
+        await Legacy020Schema.CreateAsync(db.ConnectionString, "dbo", table);
+        await SqlTestDb.ExecuteAsync(db.ConnectionString, $$"""
+            UPDATE dbo.[{{table}}] SET timestamp_utc = DATEADD(DAY, -100, SYSDATETIMEOFFSET()) WHERE event_id = 'legacy-1';
+            INSERT INTO dbo.[{{table}}] (event_id, timestamp_utc, duration_ms, payload)
+            VALUES ('legacy-telemetry', DATEADD(DAY, -40, SYSDATETIMEOFFSET()), 1, N'{"http.path":"/health"}');
+            """);
+        await using var sink = SinkFactory.SqlServer(db.ConnectionString, table, Configure);
+        await sink.InitializeAsync(TestContext.Current.CancellationToken);
+
+        var result = await sink.RunRetentionCycleAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(1L, result.TotalDeleted);
+        Assert.Equal("legacy-1", await SqlTestDb.ScalarAsync<string>(db.ConnectionString,
+            $"SELECT STRING_AGG(event_id, ',') FROM dbo.[{table}]"));
+    }
 }

@@ -37,6 +37,8 @@ internal sealed class SqlServerRetentionStore(string connectionString, SqlServer
         };
         command.Parameters.Add(new SqlParameter("@batch", SqlDbType.Int) { Value = batchSize });
         command.Parameters.Add(new SqlParameter("@period_seconds", SqlDbType.Int) { Value = checked((int)pass.Period.TotalSeconds) });
+        for (var i = 0; i < pass.KeepWhenPresent.Count; i++)
+            command.Parameters.Add(new SqlParameter($"@path_{i}", SqlDbType.NVarChar, 4000) { Value = SqlServerRetentionSql.JsonPath(pass.KeepWhenPresent[i]) });
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 

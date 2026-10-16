@@ -16,19 +16,20 @@ internal sealed class SqlServerIndexBuilder(string connectionString, SqlServerTa
         await using var connection = new SqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
 
-        var edition = await GetEngineEditionAsync(connection, cancellationToken).ConfigureAwait(false);
-        var mode = IndexBuildStrategy.ForEngineEdition(edition);
+        var edition = await ScalarIntAsync(connection, SqlServerSchemaSql.EngineEdition, cancellationToken).ConfigureAwait(false);
+        var majorVersion = await ScalarIntAsync(connection, SqlServerSchemaSql.ProductMajorVersion, cancellationToken).ConfigureAwait(false);
+        var mode = IndexBuildStrategy.ForServer(edition, majorVersion);
 
         foreach (var field in pending)
         {
             var name = layout.IndexName(field);
-            var ddl = SqlServerSchemaSql.CreateIndex(layout, field, online: true);
+            var ddl = SqlServerSchemaSql.CreateIndexOnline(layout, field, lowPriority: mode == IndexBuildMode.OnlineLowPriority);
 
             if (mode == IndexBuildMode.Skip)
             {
                 logger.LogWarning(
                     "Vestige did not build index {Index}: engine edition {Edition} cannot build it online, and an offline index build would block inserts; run it during a maintenance window: {Ddl}",
-                    name, edition, ddl.Replace(" WITH (ONLINE = ON)", string.Empty, StringComparison.Ordinal));
+                    name, edition, SqlServerSchemaSql.CreateIndex(layout, field, online: false));
                 continue;
             }
 
@@ -36,8 +37,9 @@ internal sealed class SqlServerIndexBuilder(string connectionString, SqlServerTa
             {
                 await BuildOneAsync(connection, field, name, ddl, edition, cancellationToken).ConfigureAwait(false);
             }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            catch (Exception) when (cancellationToken.IsCancellationRequested)
             {
+                // SqlClient reports a cancelled command as a SqlException; shutdown is not a build failure.
                 throw;
             }
             catch (Exception ex)
@@ -94,9 +96,9 @@ internal sealed class SqlServerIndexBuilder(string connectionString, SqlServerTa
         return await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not null;
     }
 
-    private static async Task<int> GetEngineEditionAsync(SqlConnection connection, CancellationToken cancellationToken)
+    private static async Task<int> ScalarIntAsync(SqlConnection connection, string sql, CancellationToken cancellationToken)
     {
-        await using var command = new SqlCommand(SqlServerSchemaSql.EngineEdition, connection);
+        await using var command = new SqlCommand(sql, connection);
         return (int)(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
     }
 }

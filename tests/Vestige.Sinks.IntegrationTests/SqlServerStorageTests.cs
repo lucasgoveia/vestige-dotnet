@@ -136,4 +136,27 @@ public sealed class SqlServerStorageTests(SqlServerFixture db)
         Assert.Equal(1, await SqlTestDb.ScalarAsync<int>(db.ConnectionString,
             $"SELECT COUNT(*) FROM dbo.[{table}] WHERE event_id = 'legacy-1' AND audit_action IS NULL"));
     }
+
+    [Fact]
+    public async Task ExistingTable_ColumnAddBehindLongLock_GivesUpWithClearErrorInsteadOfQueueingIndefinitely()
+    {
+        db.SkipIfUnavailable();
+        var table = SqlTestDb.UniqueTable();
+        await Legacy020Schema.CreateAsync(db.ConnectionString, "dbo", table);
+        await using var holder = new Microsoft.Data.SqlClient.SqlConnection(db.ConnectionString);
+        await holder.OpenAsync(TestContext.Current.CancellationToken);
+        await using var tx = (Microsoft.Data.SqlClient.SqlTransaction)await holder.BeginTransactionAsync(TestContext.Current.CancellationToken);
+        await using (var hold = new Microsoft.Data.SqlClient.SqlCommand($"SELECT TOP 1 id FROM dbo.[{table}] WITH (TABLOCKX, HOLDLOCK)", holder, tx))
+            await hold.ExecuteScalarAsync(TestContext.Current.CancellationToken);
+        _ = Task.Delay(TimeSpan.FromSeconds(28), TestContext.Current.CancellationToken)
+            .ContinueWith(_ => tx.Rollback(), TaskScheduler.Default);
+        await using var sink = SinkFactory.SqlServer(db.ConnectionString, table, Promote);
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => sink.InitializeAsync(TestContext.Current.CancellationToken));
+
+        Assert.Contains("lock", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(25), $"waited {stopwatch.Elapsed}");
+    }
 }

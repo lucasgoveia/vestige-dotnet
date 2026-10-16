@@ -20,6 +20,14 @@ internal static class SqlServerSchemaSql
 
     public const string EngineEdition = "SELECT CAST(SERVERPROPERTY('EngineEdition') AS int)";
 
+    public const string ProductMajorVersion = "SELECT CAST(SERVERPROPERTY('ProductMajorVersion') AS int)";
+
+    /// <summary>Lock wait allowed for the metadata-only ALTER; queued Sch-M requests block every insert behind them.</summary>
+    public const int AddColumnsLockTimeoutMs = 5000;
+
+    /// <summary>Lock wait for online index builds on servers without WAIT_AT_LOW_PRIORITY.</summary>
+    public const int OnlineIndexLockTimeoutMs = 10000;
+
     public static string CreateSchema(SqlServerSinkOptions options)
     {
         var schemaLiteral = SqlServerTableLayout.Literal(options.Schema);
@@ -76,6 +84,23 @@ internal static class SqlServerSchemaSql
 
     public static string AddColumn(SqlServerTableLayout layout, PromotedField field)
         => $"ALTER TABLE {layout.QualifiedTable} ADD {SqlServerTableLayout.QuoteIdentifier(field.Column)} {field.Type.SqlTypeName} NULL;";
+
+    /// <summary>One metadata-only ALTER for every missing column, with a bounded wait for its schema lock.</summary>
+    public static string AddColumns(SqlServerTableLayout layout, IReadOnlyList<PromotedField> fields)
+        => $"SET LOCK_TIMEOUT {AddColumnsLockTimeoutMs}; ALTER TABLE {layout.QualifiedTable} ADD " +
+           string.Join(", ", fields.Select(f => $"{SqlServerTableLayout.QuoteIdentifier(f.Column)} {f.Type.SqlTypeName} NULL")) + ";";
+
+    /// <summary>
+    /// Online build for an existing table. With <paramref name="lowPriority"/> the final schema lock is
+    /// requested at low priority, so writers never queue behind it; otherwise its wait is bounded.
+    /// </summary>
+    public static string CreateIndexOnline(SqlServerTableLayout layout, PromotedField field, bool lowPriority)
+    {
+        var create = CreateIndex(layout, field, online: false).TrimEnd(';');
+        return lowPriority
+            ? create + " WITH (ONLINE = ON (WAIT_AT_LOW_PRIORITY (MAX_DURATION = 1 MINUTES, ABORT_AFTER_WAIT = SELF)));"
+            : $"SET LOCK_TIMEOUT {OnlineIndexLockTimeoutMs}; " + create + " WITH (ONLINE = ON);";
+    }
 
     public static string CreateIndex(SqlServerTableLayout layout, PromotedField field, bool online)
         => $"CREATE INDEX {SqlServerTableLayout.QuoteIdentifier(layout.IndexName(field))} ON {layout.QualifiedTable} " +

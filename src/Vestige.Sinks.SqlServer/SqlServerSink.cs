@@ -8,6 +8,9 @@ namespace Vestige.Sinks.SqlServer;
 /// <summary>Persists wide events to SQL Server using inserts for single rows and bulk copy for batches.</summary>
 public sealed class SqlServerSink : IWideEventSink
 {
+    /// <summary>How long disposal waits for background index builds and retention to stop.</summary>
+    private static readonly TimeSpan BackgroundShutdownTimeout = TimeSpan.FromSeconds(10);
+
     private readonly SqlServerSinkOptions _options;
     private readonly ILogger _logger;
     private readonly ISqlServerWriter _writer;
@@ -20,6 +23,7 @@ public sealed class SqlServerSink : IWideEventSink
     private RetentionLoop? _retention;
     private Task _retentionRun = Task.CompletedTask;
     private SqlServerTableLayout? _layout;
+    private Exception? _disabledReason;
     private PromotionWarningLimiter? _warnings;
     private int _initialized;
     private int _disposed;
@@ -63,19 +67,31 @@ public sealed class SqlServerSink : IWideEventSink
         if (Interlocked.Exchange(ref _initialized, 1) == 1)
             return;
 
-        SqlServerSinkOptionsValidator.Validate(_options);
-        var layout = new SqlServerTableLayout(_options);
-        _warnings = new PromotionWarningLimiter(_logger, _timeProvider);
-
-        await _writer.InitializeAsync(_options, layout, cancellationToken).ConfigureAwait(false);
-
+        SqlServerTableLayout layout;
         IReadOnlyList<PromotedField> pendingIndexes = [];
-        if (_options.AutoCreate)
-            pendingIndexes = await _writer.EnsureStorageAsync(cancellationToken).ConfigureAwait(false);
-        else
-            await _writer.VerifyStorageAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            SqlServerSinkOptionsValidator.Validate(_options);
+            layout = new SqlServerTableLayout(_options);
+            _warnings = new PromotionWarningLimiter(_logger, _timeProvider);
 
-        _layout = layout;
+            // Assigned before any I/O: a transient failure below (failover, serverless resume) must not
+            // disable the sink; writes reopen the connection on their own, as in 0.2.0.
+            _layout = layout;
+
+            await _writer.InitializeAsync(_options, layout, cancellationToken).ConfigureAwait(false);
+
+            if (_options.AutoCreate)
+                pendingIndexes = await _writer.EnsureStorageAsync(cancellationToken).ConfigureAwait(false);
+            else
+                await _writer.VerifyStorageAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (InvalidOperationException ex)
+        {
+            // Configuration or schema problems will not fix themselves; report the cause on every write.
+            _disabledReason = ex;
+            throw;
+        }
 
         if (pendingIndexes.Count > 0)
             _indexBuild = RunBackgroundAsync(token => BuildIndexesAsync(layout, pendingIndexes, token));
@@ -120,7 +136,15 @@ public sealed class SqlServerSink : IWideEventSink
             return;
 
         await _backgroundCts.CancelAsync().ConfigureAwait(false);
-        await Task.WhenAll(_indexBuild, _retentionRun).ConfigureAwait(false);
+        try
+        {
+            await Task.WhenAll(_indexBuild, _retentionRun).WaitAsync(BackgroundShutdownTimeout).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            // A cancelled online index build waits for the server-side rollback; its session lock dies with the connection.
+            _logger.LogWarning("Vestige SQL Server sink background work did not stop within {Timeout}; abandoning it.", BackgroundShutdownTimeout);
+        }
 
         await WaitForInFlightWriteAsync(CancellationToken.None).ConfigureAwait(false);
         await _writer.DisposeAsync().ConfigureAwait(false);
@@ -142,8 +166,9 @@ public sealed class SqlServerSink : IWideEventSink
             {
                 await work(token).ConfigureAwait(false);
             }
-            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            catch (Exception) when (token.IsCancellationRequested)
             {
+                // SqlClient reports a cancelled command as a SqlException, not an OperationCanceledException.
             }
             catch (Exception ex)
             {
@@ -154,6 +179,9 @@ public sealed class SqlServerSink : IWideEventSink
 
     private SqlServerEventRow MapRow(WideEventData data)
     {
+        if (_disabledReason is { } reason)
+            throw new InvalidOperationException($"SQL Server sink is disabled because initialization failed: {reason.Message}", reason);
+
         var layout = _layout ?? throw new InvalidOperationException("SQL Server sink must be initialized before emitting events.");
         return SqlServerEventRow.Map(data, layout.Promoted, _warnings);
     }

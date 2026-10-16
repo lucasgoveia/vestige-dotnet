@@ -51,8 +51,9 @@ public sealed class RetentionLoop
                 {
                     await RunCycleAsync(cancellationToken).ConfigureAwait(false);
                 }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                catch (Exception) when (cancellationToken.IsCancellationRequested)
                 {
+                    // Drivers differ: SqlClient faults a cancelled command with a SqlException, not an OCE.
                     throw;
                 }
                 catch (Exception ex)
@@ -63,7 +64,7 @@ public sealed class RetentionLoop
                 await Task.Delay(Interval, _timeProvider, cancellationToken).ConfigureAwait(false);
             }
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        catch (Exception) when (cancellationToken.IsCancellationRequested)
         {
         }
     }
