@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
+using Vestige.Retention;
 
 namespace Vestige.Sinks.SqlServer;
 
@@ -15,6 +16,9 @@ public sealed class SqlServerSink : IWideEventSink
     private readonly Func<SqlServerTableLayout, IReadOnlyList<PromotedField>, CancellationToken, Task>? _buildIndexes;
     private readonly CancellationTokenSource _backgroundCts = new();
     private Task _indexBuild = Task.CompletedTask;
+    private readonly Func<SqlServerTableLayout, IRetentionStore>? _retentionStore;
+    private RetentionLoop? _retention;
+    private Task _retentionRun = Task.CompletedTask;
     private SqlServerTableLayout? _layout;
     private PromotionWarningLimiter? _warnings;
     private int _initialized;
@@ -35,7 +39,8 @@ public sealed class SqlServerSink : IWideEventSink
         ILogger logger,
         ISqlServerWriter writer,
         TimeProvider timeProvider,
-        Func<SqlServerTableLayout, IReadOnlyList<PromotedField>, CancellationToken, Task>? buildIndexes = null)
+        Func<SqlServerTableLayout, IReadOnlyList<PromotedField>, CancellationToken, Task>? buildIndexes = null,
+        Func<SqlServerTableLayout, IRetentionStore>? retentionStore = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(logger);
@@ -47,6 +52,7 @@ public sealed class SqlServerSink : IWideEventSink
         _writer = writer;
         _timeProvider = timeProvider;
         _buildIndexes = buildIndexes;
+        _retentionStore = retentionStore;
     }
 
     /// <summary>Completes when background promoted-index builds started by <see cref="InitializeAsync"/> finish.</summary>
@@ -73,7 +79,20 @@ public sealed class SqlServerSink : IWideEventSink
 
         if (pendingIndexes.Count > 0)
             _indexBuild = RunBackgroundAsync(token => BuildIndexesAsync(layout, pendingIndexes, token));
+
+        if (_options.Retention.Enabled)
+        {
+            var store = _retentionStore?.Invoke(layout) ?? new SqlServerRetentionStore(_options.ConnectionString, layout);
+            _retention = new RetentionLoop(RetentionPlanner.Plan(_options.Retention), store, _logger, _timeProvider);
+            _retentionRun = RunBackgroundAsync(_retention.RunAsync);
+        }
     }
+
+    /// <summary>Run one retention cycle immediately (tests and operational tooling).</summary>
+    internal Task<RetentionCycleResult> RunRetentionCycleAsync(CancellationToken cancellationToken)
+        => _retention is { } retention
+            ? retention.RunCycleAsync(cancellationToken)
+            : throw new InvalidOperationException("Retention is not enabled for this sink.");
 
     public Task EmitAsync(WideEventData data, CancellationToken cancellationToken = default)
         => WriteAsync([MapRow(data)], cancellationToken);
@@ -101,7 +120,7 @@ public sealed class SqlServerSink : IWideEventSink
             return;
 
         await _backgroundCts.CancelAsync().ConfigureAwait(false);
-        await _indexBuild.ConfigureAwait(false);
+        await Task.WhenAll(_indexBuild, _retentionRun).ConfigureAwait(false);
 
         await WaitForInFlightWriteAsync(CancellationToken.None).ConfigureAwait(false);
         await _writer.DisposeAsync().ConfigureAwait(false);

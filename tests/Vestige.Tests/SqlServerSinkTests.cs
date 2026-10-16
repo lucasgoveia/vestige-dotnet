@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Options;
 using Vestige.Internal;
+using Vestige.Retention;
 using Vestige.Sinks.SqlServer;
 using Vestige.Tests.TestSupport;
 
@@ -155,5 +156,53 @@ public sealed class SqlServerSinkTests
 
         Assert.True(cancelled.Task.IsCompleted);
         Assert.True(writer.Disposed);
+    }
+
+    [Fact]
+    public async Task RetentionCycle_UsesPlannedPassesAgainstStore()
+    {
+        var store = new RecordingRetentionStore();
+        var options = new SqlServerSinkOptions { ConnectionString = "Server=.;Database=x" };
+        options.PromotedFields.Add("audit_action", PromotedType.String(128));
+        options.Retention.Default = TimeSpan.FromDays(30);
+        options.Retention.KeepLonger("audit_action", TimeSpan.FromDays(365));
+        await using var sink = new SqlServerSink(
+            Options.Create(options), new ListLogger<SqlServerSink>(), new FakeSqlServerWriter(), TimeProvider.System,
+            retentionStore: _ => store);
+        await sink.InitializeAsync(TestContext.Current.CancellationToken);
+
+        var result = await sink.RunRetentionCycleAsync(TestContext.Current.CancellationToken);
+
+        Assert.True(result.Acquired);
+        Assert.Equal(new[] { TimeSpan.FromDays(30), TimeSpan.FromDays(365) }, store.Passes.Select(p => p.Period));
+    }
+
+    [Fact]
+    public async Task RetentionCycle_WhenRetentionOff_Throws()
+    {
+        await using var sink = CreateSink(new FakeSqlServerWriter());
+        await sink.InitializeAsync(TestContext.Current.CancellationToken);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => sink.RunRetentionCycleAsync(TestContext.Current.CancellationToken));
+    }
+
+    private sealed class RecordingRetentionStore : IRetentionStore
+    {
+        public List<RetentionPass> Passes { get; } = [];
+
+        public Task<IAsyncDisposable?> TryAcquireLockAsync(CancellationToken cancellationToken)
+            => Task.FromResult<IAsyncDisposable?>(new NoopLease());
+
+        public Task<int> DeleteBatchAsync(RetentionPass pass, int batchSize, CancellationToken cancellationToken)
+        {
+            Passes.Add(pass);
+            return Task.FromResult(0);
+        }
+
+        private sealed class NoopLease : IAsyncDisposable
+        {
+            public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        }
     }
 }
