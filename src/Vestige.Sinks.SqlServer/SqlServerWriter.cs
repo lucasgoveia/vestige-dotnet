@@ -25,65 +25,82 @@ internal sealed class SqlServerWriter : ISqlServerWriter
     {
         var connection = await GetOpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         var options = _options ?? throw new InvalidOperationException("Sink options have not been initialized.");
+        var layout = _layout ?? throw new InvalidOperationException("Sink layout has not been initialized.");
 
-        var schema = QuoteIdentifier(options.Schema);
-        var table = QuoteIdentifier(options.Table);
-        var schemaForSchemaId = options.Schema.Replace("'", "''", StringComparison.Ordinal);
-        var schemaForExec = "[" + options.Schema.Replace("]", "]]", StringComparison.Ordinal) + "]";
-        var indexPrefix = $"{options.Schema}_{options.Table}".Replace(".", "_", StringComparison.Ordinal);
+        await ExecuteAsync(connection, SqlServerSchemaSql.CreateSchema(options), cancellationToken).ConfigureAwait(false);
 
-        await using (var cmd = new SqlCommand(
-            $"IF SCHEMA_ID(N'{schemaForSchemaId}') IS NULL EXEC('CREATE SCHEMA {schemaForExec}')",
-            connection))
+        var tableExisted = await TableExistsAsync(connection, layout, cancellationToken).ConfigureAwait(false);
+        await ExecuteAsync(connection, SqlServerSchemaSql.CreateTable(layout), cancellationToken).ConfigureAwait(false);
+        await ExecuteAsync(connection, SqlServerSchemaSql.CreateFixedIndexes(layout), cancellationToken).ConfigureAwait(false);
+
+        if (!tableExisted)
         {
-            await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            // Empty table: building inline is instant. The guard covers a replica that won the CREATE TABLE race.
+            foreach (var field in layout.Promoted.Where(f => f.Indexed))
+                await ExecuteAsync(connection, SqlServerSchemaSql.CreateIndexIfMissing(layout, field), cancellationToken).ConfigureAwait(false);
+            return [];
         }
 
-        await using (var cmd = new SqlCommand($"""
-            IF OBJECT_ID(N'{schema}.{table}', N'U') IS NULL
-                CREATE TABLE {schema}.{table} (
-                    [id] BIGINT IDENTITY(1,1) PRIMARY KEY,
-                    [event_id] VARCHAR(256) NOT NULL,
-                    [timestamp_utc] DATETIMEOFFSET(7) NOT NULL,
-                    [service_name] NVARCHAR(256) NULL,
-                    [service_version] NVARCHAR(64) NULL,
-                    [deployment_environment] NVARCHAR(128) NULL,
-                    [cloud_region] NVARCHAR(128) NULL,
-                    [trace_id] NVARCHAR(64) NULL,
-                    [span_id] NVARCHAR(32) NULL,
-                    [outcome] NVARCHAR(32) NULL,
-                    [duration_ms] FLOAT NOT NULL,
-                    [http_status_code] INT NULL,
-                    [http_method] NVARCHAR(16) NULL,
-                    [http_path] NVARCHAR(2048) NULL,
-                    [error_type] NVARCHAR(512) NULL,
-                    [payload] NVARCHAR(MAX) NOT NULL
-                );
-            """, connection))
-        {
-            await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-        }
+        var diff = await ReadDiffAsync(connection, layout, cancellationToken).ConfigureAwait(false);
+        foreach (var field in diff.MissingColumns)
+            await ExecuteAsync(connection, SqlServerSchemaSql.AddColumn(layout, field), cancellationToken).ConfigureAwait(false);
 
-        await using (var cmd = new SqlCommand($"""
-            IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'{indexPrefix}_event_id_idx' AND object_id = OBJECT_ID(N'{schema}.{table}'))
-                CREATE INDEX [{indexPrefix}_event_id_idx] ON {schema}.{table} ([event_id]);
-            IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'{indexPrefix}_timestamp_idx' AND object_id = OBJECT_ID(N'{schema}.{table}'))
-                CREATE INDEX [{indexPrefix}_timestamp_idx] ON {schema}.{table} ([timestamp_utc]);
-            IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'{indexPrefix}_service_name_idx' AND object_id = OBJECT_ID(N'{schema}.{table}'))
-                CREATE INDEX [{indexPrefix}_service_name_idx] ON {schema}.{table} ([service_name]);
-            IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'{indexPrefix}_outcome_idx' AND object_id = OBJECT_ID(N'{schema}.{table}'))
-                CREATE INDEX [{indexPrefix}_outcome_idx] ON {schema}.{table} ([outcome]);
-            IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'{indexPrefix}_trace_id_idx' AND object_id = OBJECT_ID(N'{schema}.{table}'))
-                CREATE INDEX [{indexPrefix}_trace_id_idx] ON {schema}.{table} ([trace_id]);
-            """, connection))
-        {
-            await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-        }
-
-        return [];
+        return diff.MissingIndexes;
     }
 
-    public Task VerifyStorageAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+    public async Task VerifyStorageAsync(CancellationToken cancellationToken)
+    {
+        var layout = _layout ?? throw new InvalidOperationException("Sink layout has not been initialized.");
+        if (layout.Promoted.Count == 0)
+            return;
+
+        var connection = await GetOpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        var diff = await ReadDiffAsync(connection, layout, cancellationToken).ConfigureAwait(false);
+        diff.RequireNoMissingColumns();
+    }
+
+    private static async Task ExecuteAsync(SqlConnection connection, string sql, CancellationToken cancellationToken)
+    {
+        await using var command = new SqlCommand(sql, connection);
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<bool> TableExistsAsync(SqlConnection connection, SqlServerTableLayout layout, CancellationToken cancellationToken)
+    {
+        await using var command = new SqlCommand(SqlServerSchemaSql.TableExists, connection);
+        command.Parameters.Add(new SqlParameter("@object_name", SqlDbType.NVarChar, 512) { Value = layout.QualifiedTable });
+        return (int)(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))! == 1;
+    }
+
+    private static async Task<SchemaDiff> ReadDiffAsync(SqlConnection connection, SqlServerTableLayout layout, CancellationToken cancellationToken)
+    {
+        var columns = new List<ExistingColumn>();
+        await using (var command = new SqlCommand(SqlServerSchemaSql.SelectColumns, connection))
+        {
+            command.Parameters.Add(new SqlParameter("@object_name", SqlDbType.NVarChar, 512) { Value = layout.QualifiedTable });
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                columns.Add(new ExistingColumn(
+                    reader.GetString(0),
+                    reader.GetString(1),
+                    reader.GetInt16(2),
+                    reader.GetByte(3),
+                    reader.GetBoolean(4)));
+            }
+        }
+
+        var indexes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        await using (var command = new SqlCommand(SqlServerSchemaSql.SelectIndexNames, connection))
+        {
+            command.Parameters.Add(new SqlParameter("@object_name", SqlDbType.NVarChar, 512) { Value = layout.QualifiedTable });
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                indexes.Add(reader.GetString(0));
+        }
+
+        return SchemaDiff.Compute(layout, columns, indexes);
+    }
 
     public async Task WriteSingleAsync(SqlServerEventRow row, CancellationToken cancellationToken)
     {
@@ -159,9 +176,6 @@ internal sealed class SqlServerWriter : ISqlServerWriter
 
     private static void AddNullableIntParameter(SqlCommand command, string name, int? value)
         => command.Parameters.Add(new SqlParameter(name, SqlDbType.Int) { Value = (object?)value ?? DBNull.Value });
-
-    private static string QuoteIdentifier(string identifier)
-        => "[" + identifier.Replace("]", "]]", StringComparison.Ordinal) + "]";
 
     private static void ValidateOptions(SqlServerSinkOptions options)
     {

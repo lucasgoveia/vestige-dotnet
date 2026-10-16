@@ -17,5 +17,6 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Vestige.Tests/Vestige.Tests.csproj" />
+    <Project Path="tests/Vestige.Sinks.IntegrationTests/Vestige.Sinks.IntegrationTests.csproj" />
   </Folder>
 </Solution>

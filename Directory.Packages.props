@@ -27,6 +27,8 @@
     <PackageVersion Include="xunit.v3.runner.console" Version="1.1.0" />
     <PackageVersion Include="coverlet.collector" Version="6.0.4" />
     <PackageVersion Include="Microsoft.Extensions.TimeProvider.Testing" Version="9.0.0" />
+    <PackageVersion Include="Testcontainers.MsSql" Version="4.4.0" />
+    <PackageVersion Include="Testcontainers.PostgreSql" Version="4.4.0" />
   </ItemGroup>
 
 </Project>
