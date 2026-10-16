@@ -256,7 +256,9 @@ o.Retention.KeepLonger("audit_action", TimeSpan.FromDays(365));
 
 - A background loop runs one minute after startup and then hourly.
 - It deletes in batches of 4000 rows using the database clock.
-- Only one instance purges at a time: `sp_getapplock` on SQL Server, `pg_try_advisory_lock` on PostgreSQL.
+- Only one instance purges at a time.
+  - SQL Server: a session app lock on a dedicated unpooled connection, which also runs every delete of the cycle.
+  - PostgreSQL: a transaction-scoped advisory lock taken inside each delete statement. Nothing is held between statements, so it is safe behind PgBouncer in transaction mode.
 - On SQL Server, every `KeepLonger` key must be a promoted field, so the purge stays index-friendly.
 - A row counts as carrying a key when its promoted column is set **or** the key is in `payload`. Rows written before the column was added, and rows whose value could not be converted, are therefore kept for the longer period too.
 

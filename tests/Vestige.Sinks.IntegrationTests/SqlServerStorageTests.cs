@@ -159,4 +159,25 @@ public sealed class SqlServerStorageTests(SqlServerFixture db)
         Assert.Contains("lock", ex.Message, StringComparison.OrdinalIgnoreCase);
         Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(25), $"waited {stopwatch.Elapsed}");
     }
+
+    [Fact]
+    public async Task NewTable_InlineIndexDefersToAnotherInstanceHoldingItsLock()
+    {
+        db.SkipIfUnavailable();
+        var table = SqlTestDb.UniqueTable();
+        await using var holder = new Microsoft.Data.SqlClient.SqlConnection(db.ConnectionString);
+        await holder.OpenAsync(TestContext.Current.CancellationToken);
+        var resource = SqlAppLock.Resource($"[dbo].[{table}]", "index|audit_action");
+        Assert.True(await SqlAppLock.TryAcquireAsync(holder, resource, TestContext.Current.CancellationToken));
+        await using var sink = SinkFactory.SqlServer(db.ConnectionString, table, Promote);
+
+        await sink.InitializeAsync(TestContext.Current.CancellationToken);
+
+        var indexes = await SqlTestDb.IndexNamesAsync(db.ConnectionString, "dbo", table);
+        Assert.DoesNotContain($"dbo_{table}_audit_action_idx", indexes);
+        Assert.Contains($"dbo_{table}_tenant_id_idx", indexes);
+
+        await SqlAppLock.ReleaseAsync(holder, resource);
+        await sink.IndexBuildCompletion.WaitAsync(TimeSpan.FromSeconds(60), TestContext.Current.CancellationToken);
+    }
 }

@@ -58,7 +58,7 @@ public sealed class SqlServerRetentionTests(SqlServerFixture db)
         await SeedAsync(sink, table);
         await using var holder = new SqlConnection(db.ConnectionString);
         await holder.OpenAsync(TestContext.Current.CancellationToken);
-        Assert.True(await SqlAppLock.TryAcquireAsync(holder, $"dbo_{table}_retention", TestContext.Current.CancellationToken));
+        Assert.True(await SqlAppLock.TryAcquireAsync(holder, SqlAppLock.Resource($"[dbo].[{table}]", "retention"), TestContext.Current.CancellationToken));
 
         var result = await sink.RunRetentionCycleAsync(TestContext.Current.CancellationToken);
 
@@ -85,5 +85,25 @@ public sealed class SqlServerRetentionTests(SqlServerFixture db)
         Assert.Equal(1L, result.TotalDeleted);
         Assert.Equal("legacy-1", await SqlTestDb.ScalarAsync<string>(db.ConnectionString,
             $"SELECT STRING_AGG(event_id, ',') FROM dbo.[{table}]"));
+    }
+
+    [Fact]
+    public async Task Lease_DeletesRunOnTheLockSession_SoLosingThatSessionStopsThePurge()
+    {
+        db.SkipIfUnavailable();
+        var table = SqlTestDb.UniqueTable();
+        var options = new SqlServerSinkOptions { ConnectionString = db.ConnectionString, Table = table };
+        Configure(options);
+        await using (var sink = SinkFactory.SqlServer(db.ConnectionString, table, Configure))
+            await sink.InitializeAsync(TestContext.Current.CancellationToken);
+        var store = new SqlServerRetentionStore(db.ConnectionString, new SqlServerTableLayout(options));
+
+        await using var lease = await store.TryAcquireLockAsync(TestContext.Current.CancellationToken);
+        Assert.NotNull(lease);
+        var sessionId = Assert.IsType<int>(store.ActiveSessionId);
+        await SqlTestDb.ExecuteAsync(db.ConnectionString, $"KILL {sessionId}");
+
+        await Assert.ThrowsAnyAsync<Exception>(() => store.DeleteBatchAsync(
+            new Vestige.Retention.RetentionPass(TimeSpan.FromDays(30), ["audit_action"]), 4000, TestContext.Current.CancellationToken));
     }
 }

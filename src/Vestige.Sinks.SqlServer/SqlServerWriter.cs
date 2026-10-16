@@ -34,18 +34,58 @@ internal sealed class SqlServerWriter : ISqlServerWriter
         await ExecuteAsync(connection, SqlServerSchemaSql.CreateFixedIndexes(layout), cancellationToken).ConfigureAwait(false);
 
         if (!tableExisted)
-        {
-            // Empty table: building inline is instant. The guard covers a replica that won the CREATE TABLE race.
-            foreach (var field in layout.Promoted.Where(f => f.Indexed))
-                await ExecuteAsync(connection, SqlServerSchemaSql.CreateIndexIfMissing(layout, field), cancellationToken).ConfigureAwait(false);
-            return [];
-        }
+            return await CreateIndexesOnNewTableAsync(connection, layout, cancellationToken).ConfigureAwait(false);
 
         var diff = await ReadDiffAsync(connection, layout, cancellationToken).ConfigureAwait(false);
         if (diff.MissingColumns.Count > 0)
             diff = await AddMissingColumnsAsync(connection, layout, diff, cancellationToken).ConfigureAwait(false);
 
         return diff.MissingIndexes;
+    }
+
+    /// <summary>
+    /// Empty table: building inline is instant. Each build takes the same app lock as the background builder;
+    /// an index whose lock another instance holds is left to that instance and returned as still pending.
+    /// </summary>
+    private static async Task<IReadOnlyList<PromotedField>> CreateIndexesOnNewTableAsync(
+        SqlConnection connection,
+        SqlServerTableLayout layout,
+        CancellationToken cancellationToken)
+    {
+        var pending = new List<PromotedField>();
+        foreach (var field in layout.Promoted.Where(f => f.Indexed))
+        {
+            var lockName = layout.IndexLockName(field);
+            if (!await SqlAppLock.TryAcquireAsync(connection, lockName, cancellationToken).ConfigureAwait(false))
+            {
+                pending.Add(field);
+                continue;
+            }
+
+            try
+            {
+                await ExecuteAsync(connection, SqlServerSchemaSql.CreateIndexIfMissing(layout, field), cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                await ReleaseQuietlyAsync(connection, lockName).ConfigureAwait(false);
+            }
+        }
+
+        return pending;
+    }
+
+    private static async Task ReleaseQuietlyAsync(SqlConnection connection, string lockName)
+    {
+        try
+        {
+            if (connection.State == ConnectionState.Open)
+                await SqlAppLock.ReleaseAsync(connection, lockName).ConfigureAwait(false);
+        }
+        catch (SqlException)
+        {
+            // A failed release means a broken connection, which is never returned to the pool.
+        }
     }
 
     private const int AddColumnsAttempts = 3;
@@ -92,9 +132,16 @@ internal sealed class SqlServerWriter : ISqlServerWriter
         }
         finally
         {
-            // SET LOCK_TIMEOUT is session-scoped; never leave it on the connection inserts use.
-            if (connection.State == ConnectionState.Open)
-                await ExecuteAsync(connection, "SET LOCK_TIMEOUT -1;", CancellationToken.None).ConfigureAwait(false);
+            // SET LOCK_TIMEOUT is session-scoped; never leave it on the connection inserts use. A failure here
+            // means the connection is broken (and will not be reused), so it must not mask the original error.
+            try
+            {
+                if (connection.State == ConnectionState.Open)
+                    await ExecuteAsync(connection, "SET LOCK_TIMEOUT -1;", CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (SqlException)
+            {
+            }
         }
     }
 

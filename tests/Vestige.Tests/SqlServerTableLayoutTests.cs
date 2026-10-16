@@ -56,7 +56,8 @@ public sealed class SqlServerTableLayoutTests
         Assert.Equal("[ops].[wide.events]]x''y]", layout.QualifiedTableLiteral);
         Assert.Equal("ops_wide_events]x'y", layout.IndexPrefix);
         Assert.Equal("ops_wide_events]x'y_audit_action_idx", layout.IndexName(layout.Promoted[0]));
-        Assert.Equal("ops_wide_events]x'y_retention", layout.RetentionLockName);
+        Assert.Equal(SqlAppLock.Resource("[ops].[wide.events]]x'y]", "retention"), layout.RetentionLockName);
+        Assert.Equal(SqlAppLock.Resource("[ops].[wide.events]]x'y]", "index|audit_action"), layout.IndexLockName(layout.Promoted[0]));
     }
 
     [Fact]

@@ -4,30 +4,29 @@ using Vestige.Retention;
 
 namespace Vestige.Sinks.Postgres;
 
+/// <summary>
+/// Retention against PostgreSQL. Coordination uses transaction-scoped advisory locks taken inside each
+/// statement, never session locks: nothing outlives a statement, so a pooled or PgBouncer-multiplexed
+/// backend can never be left holding a lock.
+/// </summary>
 internal sealed class PostgresRetentionStore(string connectionString, PostgresSinkOptions options) : IRetentionStore
 {
     private const int DeleteCommandTimeoutSeconds = 300;
+    private static readonly IAsyncDisposable NoLease = new NoopLease();
     private readonly string _lockKey = PostgresRetentionSql.LockKey(options.Schema, options.Table);
 
+    /// <summary>
+    /// Probes the lock: skips the cycle when another instance is purging right now. Each batch then takes
+    /// the lock again for its own statement, so instances interleave at worst and never delete concurrently.
+    /// </summary>
     public async Task<IAsyncDisposable?> TryAcquireLockAsync(CancellationToken cancellationToken)
     {
-        var connection = new NpgsqlConnection(connectionString);
-        try
-        {
-            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-            await using var command = new NpgsqlCommand("SELECT pg_try_advisory_lock(hashtext(@key))", connection);
-            command.Parameters.AddWithValue("key", NpgsqlDbType.Text, _lockKey);
-            if ((bool)(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!)
-                return new Lease(connection, _lockKey);
-        }
-        catch
-        {
-            await connection.DisposeAsync().ConfigureAwait(false);
-            throw;
-        }
-
-        await connection.DisposeAsync().ConfigureAwait(false);
-        return null;
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = new NpgsqlCommand(PostgresRetentionSql.LockProbe, connection);
+        AddLockParameters(command);
+        var free = (bool)(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
+        return free ? NoLease : null;
     }
 
     public async Task<int> DeleteBatchAsync(RetentionPass pass, int batchSize, CancellationToken cancellationToken)
@@ -38,6 +37,7 @@ internal sealed class PostgresRetentionStore(string connectionString, PostgresSi
         {
             CommandTimeout = DeleteCommandTimeoutSeconds,
         };
+        AddLockParameters(command);
         command.Parameters.AddWithValue("batch", NpgsqlDbType.Integer, batchSize);
         command.Parameters.AddWithValue("period_seconds", NpgsqlDbType.Double, pass.Period.TotalSeconds);
         for (var i = 0; i < pass.KeepWhenPresent.Count; i++)
@@ -45,22 +45,14 @@ internal sealed class PostgresRetentionStore(string connectionString, PostgresSi
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private sealed class Lease(NpgsqlConnection connection, string key) : IAsyncDisposable
+    private void AddLockParameters(NpgsqlCommand command)
     {
-        public async ValueTask DisposeAsync()
-        {
-            try
-            {
-                await using var command = new NpgsqlCommand("SELECT pg_advisory_unlock(hashtext(@key))", connection);
-                command.Parameters.AddWithValue("key", NpgsqlDbType.Text, key);
-                await command.ExecuteNonQueryAsync(CancellationToken.None).ConfigureAwait(false);
-            }
-            catch (NpgsqlException)
-            {
-                // Session-level advisory locks are released when the connection closes anyway.
-            }
+        command.Parameters.AddWithValue("ns", NpgsqlDbType.Integer, PostgresRetentionSql.LockNamespace);
+        command.Parameters.AddWithValue("key", NpgsqlDbType.Text, _lockKey);
+    }
 
-            await connection.DisposeAsync().ConfigureAwait(false);
-        }
+    private sealed class NoopLease : IAsyncDisposable
+    {
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 }

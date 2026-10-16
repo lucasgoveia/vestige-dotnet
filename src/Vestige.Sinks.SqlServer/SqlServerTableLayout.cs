@@ -31,7 +31,7 @@ internal sealed class SqlServerTableLayout
         QualifiedTable = $"{QuoteIdentifier(options.Schema)}.{QuoteIdentifier(options.Table)}";
         QualifiedTableLiteral = Literal(QualifiedTable);
         IndexPrefix = $"{options.Schema}_{options.Table}".Replace(".", "_", StringComparison.Ordinal);
-        RetentionLockName = $"{IndexPrefix}_retention";
+        RetentionLockName = SqlAppLock.Resource(QualifiedTable, "retention");
         InsertColumns = [.. FixedInsertColumns, .. Promoted.Select(f => f.Column)];
         _columnsByKey = Promoted.ToDictionary(f => f.Key, f => f.Column, StringComparer.Ordinal);
 
@@ -64,6 +64,9 @@ internal sealed class SqlServerTableLayout
     public string InsertSql { get; }
 
     public string IndexName(PromotedField field) => $"{IndexPrefix}_{field.Column}_idx";
+
+    /// <summary>App-lock resource guarding the build of <paramref name="field"/>'s index on this table.</summary>
+    public string IndexLockName(PromotedField field) => SqlAppLock.Resource(QualifiedTable, "index|" + field.Column);
 
     public string ColumnFor(string key) => _columnsByKey[key];
 

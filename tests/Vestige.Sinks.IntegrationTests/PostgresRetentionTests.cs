@@ -80,8 +80,9 @@ public sealed class PostgresRetentionTests(PostgresFixture db)
         await SeedAsync(sink, table);
         await using var holder = new NpgsqlConnection(db.ConnectionString);
         await holder.OpenAsync(TestContext.Current.CancellationToken);
-        await using (var lockCommand = new NpgsqlCommand("SELECT pg_advisory_lock(hashtext(@key))", holder))
+        await using (var lockCommand = new NpgsqlCommand("SELECT pg_advisory_lock(@ns, hashtext(@key))", holder))
         {
+            lockCommand.Parameters.AddWithValue("ns", PostgresRetentionSql.LockNamespace);
             lockCommand.Parameters.AddWithValue("key", PostgresRetentionSql.LockKey("vestige", table));
             await lockCommand.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
         }
@@ -101,5 +102,22 @@ public sealed class PostgresRetentionTests(PostgresFixture db)
         await using var sink = new PostgresSink(Options.Create(options), new ListLogger<PostgresSink>());
 
         await Assert.ThrowsAsync<InvalidOperationException>(() => sink.InitializeAsync(TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task Lease_HoldsNoSessionAdvisoryLock_SoTransactionPoolersCannotLeakIt()
+    {
+        db.SkipIfUnavailable();
+        var table = SqlTestDb.UniqueTable();
+        var store = new PostgresRetentionStore(db.ConnectionString, CreateOptions(table));
+
+        await using var lease = await store.TryAcquireLockAsync(TestContext.Current.CancellationToken);
+
+        Assert.NotNull(lease);
+        await using var connection = new NpgsqlConnection(db.ConnectionString);
+        await connection.OpenAsync(TestContext.Current.CancellationToken);
+        await using var command = new NpgsqlCommand(
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted", connection);
+        Assert.Equal(0L, (long)(await command.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
     }
 }

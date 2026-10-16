@@ -13,7 +13,8 @@ internal sealed class SqlServerIndexBuilder(string connectionString, SqlServerTa
         if (pending.Count == 0)
             return;
 
-        await using var connection = new SqlConnection(connectionString);
+        // Unpooled: a lock left behind by a failed release dies with the session instead of idling in the pool.
+        await using var connection = new SqlConnection(SqlAppLock.LockConnectionString(connectionString));
         await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
 
         var edition = await ScalarIntAsync(connection, SqlServerSchemaSql.EngineEdition, cancellationToken).ConfigureAwait(false);
@@ -57,7 +58,8 @@ internal sealed class SqlServerIndexBuilder(string connectionString, SqlServerTa
         int edition,
         CancellationToken cancellationToken)
     {
-        if (!await SqlAppLock.TryAcquireAsync(connection, name, cancellationToken).ConfigureAwait(false))
+        var lockName = layout.IndexLockName(field);
+        if (!await SqlAppLock.TryAcquireAsync(connection, lockName, cancellationToken).ConfigureAwait(false))
         {
             logger.LogDebug("Vestige skipped index {Index}: another instance is building it.", name);
             return;
@@ -79,11 +81,11 @@ internal sealed class SqlServerIndexBuilder(string connectionString, SqlServerTa
             try
             {
                 if (connection.State == ConnectionState.Open)
-                    await SqlAppLock.ReleaseAsync(connection, name).ConfigureAwait(false);
+                    await SqlAppLock.ReleaseAsync(connection, lockName).ConfigureAwait(false);
             }
             catch (SqlException)
             {
-                // The session-owned lock is released when the connection closes anyway.
+                // The connection is unpooled, so closing it ends the session and its lock.
             }
         }
     }
