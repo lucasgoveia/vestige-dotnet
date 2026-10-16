@@ -1,3 +1,5 @@
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 
 namespace Vestige.Sinks.SqlServer;
@@ -6,23 +8,40 @@ namespace Vestige.Sinks.SqlServer;
 public sealed class SqlServerSink : IWideEventSink
 {
     private readonly SqlServerSinkOptions _options;
+    private readonly ILogger _logger;
     private readonly ISqlServerWriter _writer;
+    private readonly TimeProvider _timeProvider;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private SqlServerTableLayout? _layout;
+    private PromotionWarningLimiter? _warnings;
     private int _initialized;
     private int _disposed;
 
     public SqlServerSink(IOptions<SqlServerSinkOptions> options)
-        : this(options, new SqlServerWriter())
+        : this(options, NullLogger<SqlServerSink>.Instance)
     {
     }
 
-    internal SqlServerSink(IOptions<SqlServerSinkOptions> options, ISqlServerWriter writer)
+    public SqlServerSink(IOptions<SqlServerSinkOptions> options, ILogger<SqlServerSink> logger)
+        : this(options, logger, new SqlServerWriter(), TimeProvider.System)
+    {
+    }
+
+    internal SqlServerSink(
+        IOptions<SqlServerSinkOptions> options,
+        ILogger logger,
+        ISqlServerWriter writer,
+        TimeProvider timeProvider)
     {
         ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(writer);
+        ArgumentNullException.ThrowIfNull(timeProvider);
 
         _options = options.Value;
+        _logger = logger;
         _writer = writer;
+        _timeProvider = timeProvider;
     }
 
     public async Task InitializeAsync(CancellationToken cancellationToken = default)
@@ -30,14 +49,22 @@ public sealed class SqlServerSink : IWideEventSink
         if (Interlocked.Exchange(ref _initialized, 1) == 1)
             return;
 
-        await _writer.InitializeAsync(_options, cancellationToken).ConfigureAwait(false);
+        SqlServerSinkOptionsValidator.Validate(_options);
+        var layout = new SqlServerTableLayout(_options);
+        _warnings = new PromotionWarningLimiter(_logger, _timeProvider);
+
+        await _writer.InitializeAsync(_options, layout, cancellationToken).ConfigureAwait(false);
 
         if (_options.AutoCreate)
             await _writer.EnsureStorageAsync(cancellationToken).ConfigureAwait(false);
+        else
+            await _writer.VerifyStorageAsync(cancellationToken).ConfigureAwait(false);
+
+        _layout = layout;
     }
 
     public Task EmitAsync(WideEventData data, CancellationToken cancellationToken = default)
-        => WriteAsync([SqlServerEventRow.Map(data)], cancellationToken);
+        => WriteAsync([MapRow(data)], cancellationToken);
 
     public async Task EmitBatchAsync(IReadOnlyList<WideEventData> batch, CancellationToken cancellationToken = default)
     {
@@ -48,7 +75,7 @@ public sealed class SqlServerSink : IWideEventSink
 
         var rows = new List<SqlServerEventRow>(batch.Count);
         foreach (var data in batch)
-            rows.Add(SqlServerEventRow.Map(data));
+            rows.Add(MapRow(data));
 
         await WriteAsync(rows, cancellationToken).ConfigureAwait(false);
     }
@@ -64,6 +91,12 @@ public sealed class SqlServerSink : IWideEventSink
         await WaitForInFlightWriteAsync(CancellationToken.None).ConfigureAwait(false);
         await _writer.DisposeAsync().ConfigureAwait(false);
         _writeLock.Dispose();
+    }
+
+    private SqlServerEventRow MapRow(WideEventData data)
+    {
+        var layout = _layout ?? throw new InvalidOperationException("SQL Server sink must be initialized before emitting events.");
+        return SqlServerEventRow.Map(data, layout.Promoted, _warnings);
     }
 
     private async Task WriteAsync(IReadOnlyList<SqlServerEventRow> rows, CancellationToken cancellationToken)

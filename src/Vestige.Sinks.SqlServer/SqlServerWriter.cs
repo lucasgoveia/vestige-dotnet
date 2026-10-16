@@ -7,18 +7,21 @@ internal sealed class SqlServerWriter : ISqlServerWriter
 {
     private SqlConnection? _connection;
     private SqlServerSinkOptions? _options;
+    private SqlServerTableLayout? _layout;
 
-    public async Task InitializeAsync(SqlServerSinkOptions options, CancellationToken cancellationToken)
+    public async Task InitializeAsync(SqlServerSinkOptions options, SqlServerTableLayout layout, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(layout);
         ValidateOptions(options);
 
         _options = options;
+        _layout = layout;
         _connection = new SqlConnection(options.ConnectionString);
         await _connection.OpenAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task EnsureStorageAsync(CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<PromotedField>> EnsureStorageAsync(CancellationToken cancellationToken)
     {
         var connection = await GetOpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         var options = _options ?? throw new InvalidOperationException("Sink options have not been initialized.");
@@ -76,19 +79,19 @@ internal sealed class SqlServerWriter : ISqlServerWriter
         {
             await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
+
+        return [];
     }
+
+    public Task VerifyStorageAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 
     public async Task WriteSingleAsync(SqlServerEventRow row, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(row);
 
         var connection = await GetOpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-        var options = _options ?? throw new InvalidOperationException("Sink options have not been initialized.");
-
-        var sql =
-            $"INSERT INTO {QuoteIdentifier(options.Schema)}.{QuoteIdentifier(options.Table)} " +
-            "(event_id, timestamp_utc, service_name, service_version, deployment_environment, cloud_region, trace_id, span_id, outcome, duration_ms, http_status_code, http_method, http_path, error_type, payload) " +
-            "VALUES (@event_id, @timestamp_utc, @service_name, @service_version, @deployment_environment, @cloud_region, @trace_id, @span_id, @outcome, @duration_ms, @http_status_code, @http_method, @http_path, @error_type, @payload)";
+        var layout = _layout ?? throw new InvalidOperationException("Sink layout has not been initialized.");
+        var sql = layout.InsertSql;
 
         await using var command = new SqlCommand(sql, connection);
         command.Parameters.Add(new SqlParameter("@event_id", SqlDbType.VarChar, 256) { Value = row.EventId });
@@ -106,6 +109,7 @@ internal sealed class SqlServerWriter : ISqlServerWriter
         AddNullableStringParameter(command, "@http_path", row.HttpPath);
         AddNullableStringParameter(command, "@error_type", row.ErrorType);
         command.Parameters.Add(new SqlParameter("@payload", SqlDbType.NVarChar, -1) { Value = row.PayloadJson });
+        layout.AddPromotedParameters(command, row);
 
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
@@ -117,28 +121,18 @@ internal sealed class SqlServerWriter : ISqlServerWriter
             return;
 
         var connection = await GetOpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-        var options = _options ?? throw new InvalidOperationException("Sink options have not been initialized.");
+        var layout = _layout ?? throw new InvalidOperationException("Sink layout has not been initialized.");
 
         using var bulkCopy = new SqlBulkCopy(connection);
-        bulkCopy.DestinationTableName = $"{QuoteIdentifier(options.Schema)}.{QuoteIdentifier(options.Table)}";
-        bulkCopy.ColumnMappings.Add("event_id", "event_id");
-        bulkCopy.ColumnMappings.Add("timestamp_utc", "timestamp_utc");
-        bulkCopy.ColumnMappings.Add("service_name", "service_name");
-        bulkCopy.ColumnMappings.Add("service_version", "service_version");
-        bulkCopy.ColumnMappings.Add("deployment_environment", "deployment_environment");
-        bulkCopy.ColumnMappings.Add("cloud_region", "cloud_region");
-        bulkCopy.ColumnMappings.Add("trace_id", "trace_id");
-        bulkCopy.ColumnMappings.Add("span_id", "span_id");
-        bulkCopy.ColumnMappings.Add("outcome", "outcome");
-        bulkCopy.ColumnMappings.Add("duration_ms", "duration_ms");
-        bulkCopy.ColumnMappings.Add("http_status_code", "http_status_code");
-        bulkCopy.ColumnMappings.Add("http_method", "http_method");
-        bulkCopy.ColumnMappings.Add("http_path", "http_path");
-        bulkCopy.ColumnMappings.Add("error_type", "error_type");
-        bulkCopy.ColumnMappings.Add("payload", "payload");
+        bulkCopy.DestinationTableName = layout.QualifiedTable;
+        foreach (var column in layout.InsertColumns)
+            bulkCopy.ColumnMappings.Add(column, column);
 
-        using var dataTable = BuildDataTable(batch);
-        await bulkCopy.WriteToServerAsync(dataTable).ConfigureAwait(false);
+        using var dataTable = layout.CreateDataTable();
+        foreach (var row in batch)
+            layout.AddRow(dataTable, row);
+
+        await bulkCopy.WriteToServerAsync(dataTable, cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask DisposeAsync()
@@ -158,48 +152,6 @@ internal sealed class SqlServerWriter : ISqlServerWriter
             await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
 
         return connection;
-    }
-
-    private static DataTable BuildDataTable(IReadOnlyList<SqlServerEventRow> batch)
-    {
-        var dt = new DataTable();
-        dt.Columns.Add("event_id", typeof(string));
-        dt.Columns.Add("timestamp_utc", typeof(DateTimeOffset));
-        dt.Columns.Add("service_name", typeof(string));
-        dt.Columns.Add("service_version", typeof(string));
-        dt.Columns.Add("deployment_environment", typeof(string));
-        dt.Columns.Add("cloud_region", typeof(string));
-        dt.Columns.Add("trace_id", typeof(string));
-        dt.Columns.Add("span_id", typeof(string));
-        dt.Columns.Add("outcome", typeof(string));
-        dt.Columns.Add("duration_ms", typeof(double));
-        dt.Columns.Add("http_status_code", typeof(int));
-        dt.Columns.Add("http_method", typeof(string));
-        dt.Columns.Add("http_path", typeof(string));
-        dt.Columns.Add("error_type", typeof(string));
-        dt.Columns.Add("payload", typeof(string));
-
-        foreach (var row in batch)
-        {
-            dt.Rows.Add(
-                row.EventId,
-                row.TimestampUtc,
-                (object?)row.ServiceName ?? DBNull.Value,
-                (object?)row.ServiceVersion ?? DBNull.Value,
-                (object?)row.DeploymentEnvironment ?? DBNull.Value,
-                (object?)row.CloudRegion ?? DBNull.Value,
-                (object?)row.TraceId ?? DBNull.Value,
-                (object?)row.SpanId ?? DBNull.Value,
-                (object?)row.Outcome ?? DBNull.Value,
-                row.DurationMs,
-                (object?)row.HttpStatusCode ?? DBNull.Value,
-                (object?)row.HttpMethod ?? DBNull.Value,
-                (object?)row.HttpPath ?? DBNull.Value,
-                (object?)row.ErrorType ?? DBNull.Value,
-                row.PayloadJson);
-        }
-
-        return dt;
     }
 
     private static void AddNullableStringParameter(SqlCommand command, string name, string? value)
