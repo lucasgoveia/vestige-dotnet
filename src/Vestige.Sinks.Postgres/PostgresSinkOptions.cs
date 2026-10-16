@@ -1,3 +1,5 @@
+using Vestige.Retention;
+
 namespace Vestige.Sinks.Postgres;
 
 /// <summary>Configuration for the PostgreSQL sink.</summary>
@@ -14,5 +16,8 @@ public sealed class PostgresSinkOptions
 
     /// <summary>Create schema, table, and indexes automatically when missing.</summary>
     public bool AutoCreate { get; set; } = true;
+
+    /// <summary>Tiered retention. Off until <see cref="RetentionOptions.Default"/> is set.</summary>
+    public RetentionOptions Retention { get; } = new();
 
 }
