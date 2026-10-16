@@ -86,4 +86,74 @@ public sealed class SqlServerSinkTests
             () => sink.EmitAsync(MakeData(), TestContext.Current.CancellationToken));
         Assert.Contains("must be initialized", ex.Message);
     }
+
+    [Fact]
+    public async Task Initialize_ReturnsBeforePendingIndexBuildFinishes()
+    {
+        var writer = new FakeSqlServerWriter();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        IReadOnlyList<PromotedField>? built = null;
+        var options = new SqlServerSinkOptions { ConnectionString = "Server=.;Database=x" };
+        options.PromotedFields.Add("audit_action", PromotedType.String(128));
+        writer.PendingIndexes = [options.PromotedFields[0]];
+        await using var sink = new SqlServerSink(
+            Options.Create(options), new ListLogger<SqlServerSink>(), writer, TimeProvider.System,
+            buildIndexes: async (_, pending, ct) =>
+            {
+                built = pending;
+                started.SetResult();
+                await release.Task.WaitAsync(ct);
+            });
+
+        await sink.InitializeAsync(TestContext.Current.CancellationToken);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        Assert.False(sink.IndexBuildCompletion.IsCompleted);
+        Assert.Equal("audit_action", Assert.Single(built!).Column);
+        release.SetResult();
+        await sink.IndexBuildCompletion.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
+    public async Task Initialize_NothingPending_DoesNotStartBuilder()
+    {
+        var calls = 0;
+        await using var sink = new SqlServerSink(
+            Options.Create(new SqlServerSinkOptions { ConnectionString = "Server=.;Database=x" }),
+            new ListLogger<SqlServerSink>(), new FakeSqlServerWriter(), TimeProvider.System,
+            buildIndexes: (_, _, _) =>
+            {
+                calls++;
+                return Task.CompletedTask;
+            });
+
+        await sink.InitializeAsync(TestContext.Current.CancellationToken);
+
+        Assert.True(sink.IndexBuildCompletion.IsCompletedSuccessfully);
+        Assert.Equal(0, calls);
+    }
+
+    [Fact]
+    public async Task Dispose_CancelsRunningIndexBuild_WithoutThrowing()
+    {
+        var writer = new FakeSqlServerWriter();
+        var options = new SqlServerSinkOptions { ConnectionString = "Server=.;Database=x" };
+        options.PromotedFields.Add("audit_action", PromotedType.String(128));
+        writer.PendingIndexes = [options.PromotedFields[0]];
+        var cancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sink = new SqlServerSink(
+            Options.Create(options), new ListLogger<SqlServerSink>(), writer, TimeProvider.System,
+            buildIndexes: async (_, _, ct) =>
+            {
+                ct.Register(() => cancelled.TrySetResult());
+                await Task.Delay(Timeout.Infinite, ct);
+            });
+        await sink.InitializeAsync(TestContext.Current.CancellationToken);
+
+        await sink.DisposeAsync();
+
+        Assert.True(cancelled.Task.IsCompleted);
+        Assert.True(writer.Disposed);
+    }
 }

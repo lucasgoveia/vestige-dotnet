@@ -42,8 +42,18 @@ internal sealed class SqlServerWriter : ISqlServerWriter
         }
 
         var diff = await ReadDiffAsync(connection, layout, cancellationToken).ConfigureAwait(false);
-        foreach (var field in diff.MissingColumns)
-            await ExecuteAsync(connection, SqlServerSchemaSql.AddColumn(layout, field), cancellationToken).ConfigureAwait(false);
+        try
+        {
+            foreach (var field in diff.MissingColumns)
+                await ExecuteAsync(connection, SqlServerSchemaSql.AddColumn(layout, field), cancellationToken).ConfigureAwait(false);
+        }
+        catch (SqlException ex) when (ex.Number == 2705)
+        {
+            // Another replica added the column first; re-read and add whatever is still missing.
+            diff = await ReadDiffAsync(connection, layout, cancellationToken).ConfigureAwait(false);
+            foreach (var field in diff.MissingColumns)
+                await ExecuteAsync(connection, SqlServerSchemaSql.AddColumn(layout, field), cancellationToken).ConfigureAwait(false);
+        }
 
         return diff.MissingIndexes;
     }
