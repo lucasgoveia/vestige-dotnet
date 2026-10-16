@@ -220,6 +220,45 @@ builder.Services
 | [`Vestige.Bridges.Serilog`](src/Vestige.Bridges.Serilog) | Forward Serilog events to the current wide event. |
 | [`Vestige.Bridges.MicrosoftLogging`](src/Vestige.Bridges.MicrosoftLogging) | Capture `ILogger` calls on the current wide event. |
 
+## Querying & Retention (SQL Server and PostgreSQL sinks)
+
+### Promoted fields (SQL Server)
+
+The SQL Server sink stores well-known fields as columns and everything else in `payload`. SQL Server
+cannot index JSON, so promote the fields you filter on into typed, indexed columns:
+
+```csharp
+.AddSqlServerSink(o =>
+{
+    o.ConnectionString = cs;
+    o.PromotedFields.Add("audit_action", PromotedType.String(128));
+    o.PromotedFields.Add("tenant_id", PromotedType.Guid);
+    o.PromotedFields.Add("user.id", PromotedType.String(64), column: "user_id", indexed: false);
+});
+```
+
+- Types: `String(n)` (1–4000), `Guid`, `Int`, `Long`, `Bool`, `DateTimeOffset`.
+- The column defaults to the key lower-cased, with non `[a-z0-9_]` characters replaced by `_`.
+- Indexed fields get `([column], [timestamp_utc] DESC)`.
+- A value that cannot be converted is written as `NULL` and logged as a warning at most once a minute per field. The original value is always kept in `payload`.
+- **Upgrading an existing table:** missing columns are added as `NULL` (metadata only, instant). Indexes are then built **in the background** after startup, with `ONLINE = ON` on Enterprise/Developer, Azure SQL Database and Managed Instance. On other editions the sink logs the `CREATE INDEX` statement for you to run in a maintenance window, because an offline build would block inserts.
+- Rows written before the upgrade keep `NULL` in promoted columns. Vestige never alters or drops a column.
+- With `AutoCreate = false`, startup fails if a promoted column is missing.
+
+### Retention (SQL Server and PostgreSQL)
+
+Retention is **off by default**. Enable it with a default period, then keep events carrying a given field for longer:
+
+```csharp
+o.Retention.Default = TimeSpan.FromDays(30);
+o.Retention.KeepLonger("audit_action", TimeSpan.FromDays(365));
+```
+
+- A background loop runs one minute after startup and then hourly.
+- It deletes in batches of 4000 rows using the database clock.
+- Only one instance purges at a time: `sp_getapplock` on SQL Server, `pg_try_advisory_lock` on PostgreSQL.
+- On SQL Server, every `KeepLonger` key must be a promoted field, so the purge stays index-friendly.
+
 ## Sampling
 
 Tail sampling is built into the core. Decisions happen *after* the request completes, so you can sample based on business context:

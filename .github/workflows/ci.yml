@@ -22,3 +22,5 @@ jobs:
       - run: dotnet build Vestige.slnx --configuration Release --no-restore
 
       - run: dotnet test Vestige.slnx --configuration Release --no-build
+        env:
+          VESTIGE_REQUIRE_DOCKER: '1'
