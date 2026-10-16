@@ -7,75 +7,196 @@ internal sealed class SqlServerWriter : ISqlServerWriter
 {
     private SqlConnection? _connection;
     private SqlServerSinkOptions? _options;
+    private SqlServerTableLayout? _layout;
 
-    public async Task InitializeAsync(SqlServerSinkOptions options, CancellationToken cancellationToken)
+    public async Task InitializeAsync(SqlServerSinkOptions options, SqlServerTableLayout layout, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(layout);
         ValidateOptions(options);
 
         _options = options;
+        _layout = layout;
         _connection = new SqlConnection(options.ConnectionString);
         await _connection.OpenAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task EnsureStorageAsync(CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<PromotedField>> EnsureStorageAsync(CancellationToken cancellationToken)
     {
         var connection = await GetOpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         var options = _options ?? throw new InvalidOperationException("Sink options have not been initialized.");
+        var layout = _layout ?? throw new InvalidOperationException("Sink layout has not been initialized.");
 
-        var schema = QuoteIdentifier(options.Schema);
-        var table = QuoteIdentifier(options.Table);
-        var schemaForSchemaId = options.Schema.Replace("'", "''", StringComparison.Ordinal);
-        var schemaForExec = "[" + options.Schema.Replace("]", "]]", StringComparison.Ordinal) + "]";
-        var indexPrefix = $"{options.Schema}_{options.Table}".Replace(".", "_", StringComparison.Ordinal);
+        await ExecuteAsync(connection, SqlServerSchemaSql.CreateSchema(options), cancellationToken).ConfigureAwait(false);
 
-        await using (var cmd = new SqlCommand(
-            $"IF SCHEMA_ID(N'{schemaForSchemaId}') IS NULL EXEC('CREATE SCHEMA {schemaForExec}')",
-            connection))
+        var tableExisted = await TableExistsAsync(connection, layout, cancellationToken).ConfigureAwait(false);
+        await ExecuteAsync(connection, SqlServerSchemaSql.CreateTable(layout), cancellationToken).ConfigureAwait(false);
+        await ExecuteAsync(connection, SqlServerSchemaSql.CreateFixedIndexes(layout), cancellationToken).ConfigureAwait(false);
+
+        if (!tableExisted)
+            return await CreateIndexesOnNewTableAsync(connection, layout, cancellationToken).ConfigureAwait(false);
+
+        var diff = await ReadDiffAsync(connection, layout, cancellationToken).ConfigureAwait(false);
+        if (diff.MissingColumns.Count > 0)
+            diff = await AddMissingColumnsAsync(connection, layout, diff, cancellationToken).ConfigureAwait(false);
+
+        return diff.MissingIndexes;
+    }
+
+    /// <summary>
+    /// Empty table: building inline is instant. Each build takes the same app lock as the background builder;
+    /// an index whose lock another instance holds is left to that instance and returned as still pending.
+    /// </summary>
+    private static async Task<IReadOnlyList<PromotedField>> CreateIndexesOnNewTableAsync(
+        SqlConnection connection,
+        SqlServerTableLayout layout,
+        CancellationToken cancellationToken)
+    {
+        var pending = new List<PromotedField>();
+        foreach (var field in layout.Promoted.Where(f => f.Indexed))
         {
-            await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            var lockName = layout.IndexLockName(field);
+            if (!await SqlAppLock.TryAcquireAsync(connection, lockName, cancellationToken).ConfigureAwait(false))
+            {
+                pending.Add(field);
+                continue;
+            }
+
+            try
+            {
+                await ExecuteAsync(connection, SqlServerSchemaSql.CreateIndexIfMissing(layout, field), cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                await ReleaseQuietlyAsync(connection, lockName).ConfigureAwait(false);
+            }
         }
 
-        await using (var cmd = new SqlCommand($"""
-            IF OBJECT_ID(N'{schema}.{table}', N'U') IS NULL
-                CREATE TABLE {schema}.{table} (
-                    [id] BIGINT IDENTITY(1,1) PRIMARY KEY,
-                    [event_id] VARCHAR(256) NOT NULL,
-                    [timestamp_utc] DATETIMEOFFSET(7) NOT NULL,
-                    [service_name] NVARCHAR(256) NULL,
-                    [service_version] NVARCHAR(64) NULL,
-                    [deployment_environment] NVARCHAR(128) NULL,
-                    [cloud_region] NVARCHAR(128) NULL,
-                    [trace_id] NVARCHAR(64) NULL,
-                    [span_id] NVARCHAR(32) NULL,
-                    [outcome] NVARCHAR(32) NULL,
-                    [duration_ms] FLOAT NOT NULL,
-                    [http_status_code] INT NULL,
-                    [http_method] NVARCHAR(16) NULL,
-                    [http_path] NVARCHAR(2048) NULL,
-                    [error_type] NVARCHAR(512) NULL,
-                    [payload] NVARCHAR(MAX) NOT NULL
-                );
-            """, connection))
+        return pending;
+    }
+
+    private static async Task ReleaseQuietlyAsync(SqlConnection connection, string lockName)
+    {
+        try
         {
-            await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            if (connection.State == ConnectionState.Open)
+                await SqlAppLock.ReleaseAsync(connection, lockName).ConfigureAwait(false);
+        }
+        catch (SqlException)
+        {
+            // A failed release means a broken connection, which is never returned to the pool.
+        }
+    }
+
+    private const int AddColumnsAttempts = 3;
+    private static readonly TimeSpan AddColumnsRetryPause = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// The ALTER is metadata-only but needs a schema-modification lock; while it waits, every insert queues
+    /// behind it. Each attempt waits at most <see cref="SqlServerSchemaSql.AddColumnsLockTimeoutMs"/>, with
+    /// pauses between attempts that let queued writes drain.
+    /// </summary>
+    private static async Task<SchemaDiff> AddMissingColumnsAsync(
+        SqlConnection connection,
+        SqlServerTableLayout layout,
+        SchemaDiff diff,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            for (var attempt = 1; ; attempt++)
+            {
+                try
+                {
+                    await ExecuteAsync(connection, SqlServerSchemaSql.AddColumns(layout, diff.MissingColumns), cancellationToken).ConfigureAwait(false);
+                    return diff;
+                }
+                catch (SqlException ex) when (ex.Number is 1222 or 2705 && attempt < AddColumnsAttempts)
+                {
+                    // 1222: lock wait timed out. 2705: another replica added a column first.
+                    await Task.Delay(AddColumnsRetryPause, cancellationToken).ConfigureAwait(false);
+                }
+                catch (SqlException ex) when (ex.Number == 1222)
+                {
+                    throw new InvalidOperationException(
+                        $"Could not add promoted column(s) to {layout.QualifiedTable}: waited {AddColumnsAttempts} times for a schema lock " +
+                        $"({SqlServerSchemaSql.AddColumnsLockTimeoutMs} ms each) while another session held a lock on the table. " +
+                        "Restart once the blocking session has finished.",
+                        ex);
+                }
+
+                diff = await ReadDiffAsync(connection, layout, cancellationToken).ConfigureAwait(false);
+                if (diff.MissingColumns.Count == 0)
+                    return diff;
+            }
+        }
+        finally
+        {
+            // SET LOCK_TIMEOUT is session-scoped; never leave it on the connection inserts use. A failure here
+            // means the connection is broken (and will not be reused), so it must not mask the original error.
+            try
+            {
+                if (connection.State == ConnectionState.Open)
+                    await ExecuteAsync(connection, "SET LOCK_TIMEOUT -1;", CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (SqlException)
+            {
+            }
+        }
+    }
+
+    public async Task VerifyStorageAsync(CancellationToken cancellationToken)
+    {
+        var layout = _layout ?? throw new InvalidOperationException("Sink layout has not been initialized.");
+        if (layout.Promoted.Count == 0)
+            return;
+
+        var connection = await GetOpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        var diff = await ReadDiffAsync(connection, layout, cancellationToken).ConfigureAwait(false);
+        diff.RequireNoMissingColumns();
+    }
+
+    private static async Task ExecuteAsync(SqlConnection connection, string sql, CancellationToken cancellationToken)
+    {
+        await using var command = new SqlCommand(sql, connection);
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<bool> TableExistsAsync(SqlConnection connection, SqlServerTableLayout layout, CancellationToken cancellationToken)
+    {
+        await using var command = new SqlCommand(SqlServerSchemaSql.TableExists, connection);
+        command.Parameters.Add(new SqlParameter("@object_name", SqlDbType.NVarChar, 512) { Value = layout.QualifiedTable });
+        return (int)(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))! == 1;
+    }
+
+    private static async Task<SchemaDiff> ReadDiffAsync(SqlConnection connection, SqlServerTableLayout layout, CancellationToken cancellationToken)
+    {
+        var columns = new List<ExistingColumn>();
+        await using (var command = new SqlCommand(SqlServerSchemaSql.SelectColumns, connection))
+        {
+            command.Parameters.Add(new SqlParameter("@object_name", SqlDbType.NVarChar, 512) { Value = layout.QualifiedTable });
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                columns.Add(new ExistingColumn(
+                    reader.GetString(0),
+                    reader.GetString(1),
+                    reader.GetInt16(2),
+                    reader.GetByte(3),
+                    reader.GetBoolean(4)));
+            }
         }
 
-        await using (var cmd = new SqlCommand($"""
-            IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'{indexPrefix}_event_id_idx' AND object_id = OBJECT_ID(N'{schema}.{table}'))
-                CREATE INDEX [{indexPrefix}_event_id_idx] ON {schema}.{table} ([event_id]);
-            IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'{indexPrefix}_timestamp_idx' AND object_id = OBJECT_ID(N'{schema}.{table}'))
-                CREATE INDEX [{indexPrefix}_timestamp_idx] ON {schema}.{table} ([timestamp_utc]);
-            IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'{indexPrefix}_service_name_idx' AND object_id = OBJECT_ID(N'{schema}.{table}'))
-                CREATE INDEX [{indexPrefix}_service_name_idx] ON {schema}.{table} ([service_name]);
-            IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'{indexPrefix}_outcome_idx' AND object_id = OBJECT_ID(N'{schema}.{table}'))
-                CREATE INDEX [{indexPrefix}_outcome_idx] ON {schema}.{table} ([outcome]);
-            IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'{indexPrefix}_trace_id_idx' AND object_id = OBJECT_ID(N'{schema}.{table}'))
-                CREATE INDEX [{indexPrefix}_trace_id_idx] ON {schema}.{table} ([trace_id]);
-            """, connection))
+        var indexes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        await using (var command = new SqlCommand(SqlServerSchemaSql.SelectIndexNames, connection))
         {
-            await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            command.Parameters.Add(new SqlParameter("@object_name", SqlDbType.NVarChar, 512) { Value = layout.QualifiedTable });
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                indexes.Add(reader.GetString(0));
         }
+
+        return SchemaDiff.Compute(layout, columns, indexes);
     }
 
     public async Task WriteSingleAsync(SqlServerEventRow row, CancellationToken cancellationToken)
@@ -83,12 +204,8 @@ internal sealed class SqlServerWriter : ISqlServerWriter
         ArgumentNullException.ThrowIfNull(row);
 
         var connection = await GetOpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-        var options = _options ?? throw new InvalidOperationException("Sink options have not been initialized.");
-
-        var sql =
-            $"INSERT INTO {QuoteIdentifier(options.Schema)}.{QuoteIdentifier(options.Table)} " +
-            "(event_id, timestamp_utc, service_name, service_version, deployment_environment, cloud_region, trace_id, span_id, outcome, duration_ms, http_status_code, http_method, http_path, error_type, payload) " +
-            "VALUES (@event_id, @timestamp_utc, @service_name, @service_version, @deployment_environment, @cloud_region, @trace_id, @span_id, @outcome, @duration_ms, @http_status_code, @http_method, @http_path, @error_type, @payload)";
+        var layout = _layout ?? throw new InvalidOperationException("Sink layout has not been initialized.");
+        var sql = layout.InsertSql;
 
         await using var command = new SqlCommand(sql, connection);
         command.Parameters.Add(new SqlParameter("@event_id", SqlDbType.VarChar, 256) { Value = row.EventId });
@@ -106,6 +223,7 @@ internal sealed class SqlServerWriter : ISqlServerWriter
         AddNullableStringParameter(command, "@http_path", row.HttpPath);
         AddNullableStringParameter(command, "@error_type", row.ErrorType);
         command.Parameters.Add(new SqlParameter("@payload", SqlDbType.NVarChar, -1) { Value = row.PayloadJson });
+        layout.AddPromotedParameters(command, row);
 
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
@@ -117,28 +235,18 @@ internal sealed class SqlServerWriter : ISqlServerWriter
             return;
 
         var connection = await GetOpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-        var options = _options ?? throw new InvalidOperationException("Sink options have not been initialized.");
+        var layout = _layout ?? throw new InvalidOperationException("Sink layout has not been initialized.");
 
         using var bulkCopy = new SqlBulkCopy(connection);
-        bulkCopy.DestinationTableName = $"{QuoteIdentifier(options.Schema)}.{QuoteIdentifier(options.Table)}";
-        bulkCopy.ColumnMappings.Add("event_id", "event_id");
-        bulkCopy.ColumnMappings.Add("timestamp_utc", "timestamp_utc");
-        bulkCopy.ColumnMappings.Add("service_name", "service_name");
-        bulkCopy.ColumnMappings.Add("service_version", "service_version");
-        bulkCopy.ColumnMappings.Add("deployment_environment", "deployment_environment");
-        bulkCopy.ColumnMappings.Add("cloud_region", "cloud_region");
-        bulkCopy.ColumnMappings.Add("trace_id", "trace_id");
-        bulkCopy.ColumnMappings.Add("span_id", "span_id");
-        bulkCopy.ColumnMappings.Add("outcome", "outcome");
-        bulkCopy.ColumnMappings.Add("duration_ms", "duration_ms");
-        bulkCopy.ColumnMappings.Add("http_status_code", "http_status_code");
-        bulkCopy.ColumnMappings.Add("http_method", "http_method");
-        bulkCopy.ColumnMappings.Add("http_path", "http_path");
-        bulkCopy.ColumnMappings.Add("error_type", "error_type");
-        bulkCopy.ColumnMappings.Add("payload", "payload");
+        bulkCopy.DestinationTableName = layout.QualifiedTable;
+        foreach (var column in layout.InsertColumns)
+            bulkCopy.ColumnMappings.Add(column, column);
 
-        using var dataTable = BuildDataTable(batch);
-        await bulkCopy.WriteToServerAsync(dataTable).ConfigureAwait(false);
+        using var dataTable = layout.CreateDataTable();
+        foreach (var row in batch)
+            layout.AddRow(dataTable, row);
+
+        await bulkCopy.WriteToServerAsync(dataTable, cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask DisposeAsync()
@@ -160,56 +268,11 @@ internal sealed class SqlServerWriter : ISqlServerWriter
         return connection;
     }
 
-    private static DataTable BuildDataTable(IReadOnlyList<SqlServerEventRow> batch)
-    {
-        var dt = new DataTable();
-        dt.Columns.Add("event_id", typeof(string));
-        dt.Columns.Add("timestamp_utc", typeof(DateTimeOffset));
-        dt.Columns.Add("service_name", typeof(string));
-        dt.Columns.Add("service_version", typeof(string));
-        dt.Columns.Add("deployment_environment", typeof(string));
-        dt.Columns.Add("cloud_region", typeof(string));
-        dt.Columns.Add("trace_id", typeof(string));
-        dt.Columns.Add("span_id", typeof(string));
-        dt.Columns.Add("outcome", typeof(string));
-        dt.Columns.Add("duration_ms", typeof(double));
-        dt.Columns.Add("http_status_code", typeof(int));
-        dt.Columns.Add("http_method", typeof(string));
-        dt.Columns.Add("http_path", typeof(string));
-        dt.Columns.Add("error_type", typeof(string));
-        dt.Columns.Add("payload", typeof(string));
-
-        foreach (var row in batch)
-        {
-            dt.Rows.Add(
-                row.EventId,
-                row.TimestampUtc,
-                (object?)row.ServiceName ?? DBNull.Value,
-                (object?)row.ServiceVersion ?? DBNull.Value,
-                (object?)row.DeploymentEnvironment ?? DBNull.Value,
-                (object?)row.CloudRegion ?? DBNull.Value,
-                (object?)row.TraceId ?? DBNull.Value,
-                (object?)row.SpanId ?? DBNull.Value,
-                (object?)row.Outcome ?? DBNull.Value,
-                row.DurationMs,
-                (object?)row.HttpStatusCode ?? DBNull.Value,
-                (object?)row.HttpMethod ?? DBNull.Value,
-                (object?)row.HttpPath ?? DBNull.Value,
-                (object?)row.ErrorType ?? DBNull.Value,
-                row.PayloadJson);
-        }
-
-        return dt;
-    }
-
     private static void AddNullableStringParameter(SqlCommand command, string name, string? value)
         => command.Parameters.Add(new SqlParameter(name, SqlDbType.NVarChar, -1) { Value = (object?)value ?? DBNull.Value });
 
     private static void AddNullableIntParameter(SqlCommand command, string name, int? value)
         => command.Parameters.Add(new SqlParameter(name, SqlDbType.Int) { Value = (object?)value ?? DBNull.Value });
-
-    private static string QuoteIdentifier(string identifier)
-        => "[" + identifier.Replace("]", "]]", StringComparison.Ordinal) + "]";
 
     private static void ValidateOptions(SqlServerSinkOptions options)
     {
