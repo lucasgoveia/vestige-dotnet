@@ -35,9 +35,18 @@ internal sealed class SqlServerEventRow
 
     public required string PayloadJson { get; init; }
 
-    public static SqlServerEventRow Map(WideEventData data)
+    /// <summary>Promoted column values in <see cref="SqlServerSinkOptions.PromotedFields"/> order; null means SQL NULL.</summary>
+    public object?[] PromotedValues { get; init; } = [];
+
+    public static SqlServerEventRow Map(WideEventData data) => Map(data, [], null);
+
+    public static SqlServerEventRow Map(
+        WideEventData data,
+        IReadOnlyList<PromotedField> promoted,
+        PromotionWarningLimiter? warnings)
     {
         ArgumentNullException.ThrowIfNull(data);
+        ArgumentNullException.ThrowIfNull(promoted);
 
         var eventId = GetRequiredString(data.Fields, "event_id");
         if (eventId.Length > 256)
@@ -60,7 +69,32 @@ internal sealed class SqlServerEventRow
             HttpPath = Truncate(GetOptionalString(data.Fields, "http.path"), 2048),
             ErrorType = Truncate(GetOptionalString(data.Fields, "error.type"), 512),
             PayloadJson = Encoding.UTF8.GetString(data.JsonBytes),
+            PromotedValues = MapPromoted(data.Fields, promoted, warnings),
         };
+    }
+
+    private static object?[] MapPromoted(
+        IReadOnlyDictionary<string, object?> fields,
+        IReadOnlyList<PromotedField> promoted,
+        PromotionWarningLimiter? warnings)
+    {
+        if (promoted.Count == 0)
+            return [];
+
+        var values = new object?[promoted.Count];
+        for (var i = 0; i < promoted.Count; i++)
+        {
+            var field = promoted[i];
+            if (!fields.TryGetValue(field.Key, out var raw) || raw is null)
+                continue;
+
+            if (PromotedValueConverter.TryConvert(field.Type, raw, out var converted))
+                values[i] = converted;
+            else
+                warnings?.Report(field, raw);
+        }
+
+        return values;
     }
 
     /// <summary>
@@ -68,7 +102,7 @@ internal sealed class SqlServerEventRow
     /// truncating here loses nothing — whereas overflowing the column fails the entire batch with
     /// "String or binary data would be truncated".
     /// </summary>
-    private static string? Truncate(string? value, int maxLength)
+    internal static string? Truncate(string? value, int maxLength)
     {
         if (value is null || value.Length <= maxLength)
             return value;
